@@ -1,0 +1,18 @@
+# activations and rollouts never go in git
+data/
+*.pt
+*.npz
+*.mp4
+*.safetensors
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# cluster
+slurm-*.out
+*.bak
+
+# macos
+.DS_Store
