@@ -13,14 +13,18 @@ which is:
 
 ```bash
 module reset
-module load miniconda3
+module load miniconda3/25.11.1-py312    # Pitzer requires the version
+eval "$(conda shell.bash hook)"          # needed for `conda activate` on a -p path
+conda activate /fs/ess/PAS2324/alinaliu.12278/conda/envs/vla310
 export CONDA_PKGS_DIRS=/fs/ess/PAS2324/alinaliu.12278/.conda_pkgs
 export HF_HOME=/fs/ess/PAS2324/alinaliu.12278/hf_cache
 export PYTHONNOUSERSITE=1
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
-source activate /fs/ess/PAS2324/alinaliu.12278/conda/envs/vla310
 ```
+
+Bare `module load miniconda3` fails on Pitzer with "exist but cannot be loaded
+as requested". Use `module spider miniconda3` if the pinned version goes away.
 
 ## Getting a GPU
 
