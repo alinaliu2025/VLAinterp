@@ -17,5 +17,3 @@ slurm-*.out
 # macos
 .DS_Store
 *.log
-*.log
-*.log
