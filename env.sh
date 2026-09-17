@@ -18,4 +18,10 @@ export PYTHONNOUSERSITE=1
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
+# LIBERO. The config file stops it prompting for a dataset path on first
+# import. PYTHONPATH is needed because `pip install -e` of LIBERO does not
+# make `import libero` work from outside the repo directory.
+export LIBERO_CONFIG_PATH=/fs/ess/PAS2324/alinaliu.12278/.libero
+export PYTHONPATH=/fs/ess/PAS2324/alinaliu.12278/LIBERO${PYTHONPATH:+:$PYTHONPATH}
+
 echo "[env] python: $(which python)"

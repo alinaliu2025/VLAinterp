@@ -294,9 +294,14 @@ def run_static(args, processor, model, dtype, device):
 # ---------------------------------------------------------------------------
 
 def get_libero_env(task, resolution=256):
+    from libero.libero import get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
+    # task.bddl_file is only a filename; the file lives under the suite's folder.
+    bddl_path = os.path.join(
+        get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+    )
     env = OffScreenRenderEnv(
-        bddl_file_name=task.bddl_file,
+        bddl_file_name=bddl_path,
         camera_heights=resolution,
         camera_widths=resolution,
     )
@@ -305,8 +310,22 @@ def get_libero_env(task, resolution=256):
 
 
 def get_libero_image(obs):
-    img = obs["agentview_image"][::-1, :, :]   # LIBERO returns it flipped
+    # Rotate 180 degrees, not just a vertical flip: this is what OpenVLA's
+    # LIBERO eval does to match the training preprocessing.
+    img = obs["agentview_image"][::-1, ::-1]
     return Image.fromarray(np.ascontiguousarray(img))
+
+
+def to_libero_action(action):
+    """
+    OpenVLA predicts the gripper in [0, 1] with 1 = open. LIBERO wants
+    -1 = open, +1 = close. Same two steps as OpenVLA's run_libero_eval.py:
+    rescale to [-1, +1] and binarize, then flip the sign.
+    """
+    a = np.array(action, dtype=np.float64)
+    a[-1] = np.sign(2.0 * a[-1] - 1.0)
+    a[-1] *= -1.0
+    return a
 
 
 def run_rollout(args, processor, model, dtype, device):
@@ -328,7 +347,9 @@ def run_rollout(args, processor, model, dtype, device):
     obs = env.set_init_state(initial_states[0])
 
     frames = []
-    log = {"actions": [], "task": task_description, "success": False}
+    # "actions" is the raw model output; "env_actions" is what was executed.
+    log = {"actions": [], "env_actions": [], "task": task_description,
+           "success": False}
     episode_hidden = {}
 
     t = 0
@@ -357,8 +378,10 @@ def run_rollout(args, processor, model, dtype, device):
             except RuntimeError as e:
                 print(f"[warn] step {step_idx}: {e}")
 
+        env_action = to_libero_action(action)
         log["actions"].append(np.asarray(action).tolist())
-        obs, reward, done, info = env.step(np.asarray(action).tolist())
+        log["env_actions"].append(env_action.tolist())
+        obs, reward, done, info = env.step(env_action.tolist())
         t += 1
         step_idx += 1
 
