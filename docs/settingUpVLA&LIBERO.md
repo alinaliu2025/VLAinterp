@@ -79,3 +79,18 @@ python singleVLA.py --task_suite libero_spatial --task_id 0
 
 Storage: all 32 layers at float16 is ~2MB per timestep, so a 220-step episode
 is ~450MB. Use `--layer_stride 4` or `--save_every 2` to cut that down.
+
+## Local (Mac) env
+
+For looking at captures and editing code on the laptop. It does not run the
+7B model: the script only knows cuda/cpu, and float32 on CPU needs ~30GB.
+
+```bash
+conda env create -f environment-local.yml   # once
+source env_local.sh                         # every terminal
+python peek.py static_probe.npz --plot
+```
+
+Same pins as vla310, minus CUDA, plus matplotlib. If `conda` errors with
+`MultipleKeysError`, `~/.condarc` has both `auto_activate_base` and
+`auto_activate`; keep only `auto_activate`.

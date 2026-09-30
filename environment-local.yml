@@ -1,0 +1,25 @@
+# Local (macOS, Apple Silicon) counterpart to the vla310 env on OSC.
+#
+#   conda env create -f environment-local.yml
+#   source env_local.sh
+#
+# Pins mirror docs/settingUpVLA&LIBERO.md so code behaves the same on both
+# sides. No CUDA here: torch is the plain macOS arm64 build.
+name: vla310-local
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - numpy==1.26.4
+      - torch==2.2.2
+      - torchvision==0.17.2
+      - transformers==4.40.1
+      - tokenizers==0.19.1
+      - timm==0.9.10
+      - huggingface_hub==0.23.5
+      - accelerate==0.29.3      # low_cpu_mem_usage=True in singleVLA.py needs it
+      - pillow
+      - matplotlib               # peek.py --plot
+      - imageio

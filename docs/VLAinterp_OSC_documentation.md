@@ -4,7 +4,7 @@
 
 Extending an interpretability method (logit lens / linear probing, the same family as [[dprobe]] work on LLM deception probes) to VLA models.  
 QUESTION: inside a VLA, is there a layer-wise separation between "perception" (understanding the scene) and "action-planning" (deciding what to do)? (FYI: I made this before Dr. Zhu's idea/synthesis so everything is changable)  
-The concrete first step is OpenVLA (7B), a model that takes an image + text instruction and outputs a 7-DoF robot action, evaluated against the LIBERO simulation benchmark. 
+**The concrete first step is OpenVLA (7B), a model that takes an image + text instruction and outputs a 7-DoF robot action, evaluated against the LIBERO simulation benchmark.**
 
 ## 2. How peices connect:
 
