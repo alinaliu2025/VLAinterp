@@ -7,6 +7,8 @@ Batch experiments on OpenVLA + LIBERO, built on top of singleVLA.py.
     --mode lens             rollouts + logit-lens data + hidden states for probing
     --mode lens --analyze   plots from the saved logit-lens data (CPU, no model)
     --mode probe            ridge probes on the saved hidden states (CPU, no model)
+    --mode patchlens        --mode lens, plus a logit lens on the 256 image-patch
+                            positions over the text vocabulary (perception)
 
 Modes say WHAT the script does. Runs are numbered jobs (run0, run1, ...), each
 with its own folder runs/runN/ passed as --out_dir; see runs/RUNS.md.
@@ -35,6 +37,8 @@ Output layout (out_dir is required, e.g. runs/run1):
     videos/task{t}_init{i}_{success|fail}.mp4
     lens/task{t}_init{i}.npz              --mode lens
     hidden/task{t}_init{i}.npz            --mode lens
+    patchlens/task{t}_init{i}.npz         --mode patchlens
+    patch_hidden/task{t}_init{i}.npz      --mode patchlens (every PATCH_HIDDEN_EVERY steps)
     plots/                                --analyze and --mode probe
 """
 
@@ -75,6 +79,22 @@ SEED = 7                          # official default seed
 EMPTY_TOKEN_ID = 29871            # predict_action appends this after "Out:"
 
 CSV_FIELDS = ["task_id", "init_idx", "instruction", "success", "num_steps"]
+
+# --mode patchlens. Prismatic's forward builds the sequence as
+# [BOS] + 256 projected image patches + the rest of the prompt
+# (modeling_prismatic.py: torch.cat([input_embeddings[:, :1], projected_patch_embeddings,
+# input_embeddings[:, 1:]])), so the patches sit at positions 1..256.
+N_IMAGE_PATCHES = 256
+PATCH_TOPK = 5
+PATCH_HIDDEN_EVERY = 20           # also save raw patch hidden states every N steps
+# Words scored at every patch and layer. Single SentencePiece tokens only
+# (checked with the openvla-7b tokenizer); "bowl" itself splits into
+# "▁bow" + "l", so both "▁Bowl" (one token) and "▁bow" (first piece) are kept.
+# The last five are unrelated controls.
+PATCH_CANDIDATES = ["▁Bowl", "▁bow", "▁plate", "▁cookie", "▁box", "▁cabinet", "▁table",
+                    "▁Table", "▁robot", "▁arm", "▁black", "▁wooden", "▁kitchen", "▁floor",
+                    "▁wall", "▁container", "▁pot",
+                    "▁car", "▁dog", "▁tree", "▁house", "▁sky"]
 
 
 class SanityCheckError(RuntimeError):
@@ -299,7 +319,7 @@ def decode_action_tokens(model, token_ids, unnorm_key):
     return np.where(mask, 0.5 * (normalized + 1) * (high - low) + low, normalized)
 
 
-def generate_with_hidden(model, inputs, unnorm_key):
+def generate_with_hidden(model, inputs, unnorm_key, image_hidden=False):
     """
     predict_action, line for line, except generate() is asked to also return
     every layer's hidden states. Deliberately keeps predict_action's quirk of
@@ -310,6 +330,9 @@ def generate_with_hidden(model, inputs, unnorm_key):
         token_ids  [7]            generated token ids
         hidden     [7, L+1, d]    hidden state at the position that PRODUCES
                                   each action token, all layers, on GPU
+        img        [L+1, 256, d]  (only if image_hidden) hidden states at the
+                                  256 image-patch positions, from the prefill
+                                  pass; None otherwise
     """
     import torch
     input_ids = inputs["input_ids"]
@@ -341,7 +364,66 @@ def generate_with_hidden(model, inputs, unnorm_key):
         torch.stack([layer_h[0, -1] for layer_h in step_h])
         for step_h in out.hidden_states
     ])
-    return action, token_ids, hidden
+    img = None
+    if image_hidden:
+        prefill = out.hidden_states[0]
+        seq_len = prefill[0].shape[1]
+        if seq_len != input_ids.shape[1] + N_IMAGE_PATCHES:
+            raise SanityCheckError(
+                f"prefill length {seq_len} != {input_ids.shape[1]} prompt tokens + "
+                f"{N_IMAGE_PATCHES} patches; the image positions would be wrong")
+        img = torch.stack([layer_h[0, 1:1 + N_IMAGE_PATCHES] for layer_h in prefill])
+    return action, token_ids, hidden, img
+
+
+def verify_patch_positions(model, inputs, img):
+    """
+    Layer 0 of the hidden states is the input embedding sequence, so at the
+    image positions it must equal the projector's output for this image.
+    If it doesn't, positions 1..256 are not the image patches.
+    """
+    import torch
+    with torch.no_grad():
+        proj = model.projector(model.vision_backbone(inputs["pixel_values"]))[0]
+    if proj.shape != img[0].shape or not torch.allclose(proj, img[0], atol=1e-3, rtol=1e-3):
+        diff = (proj.float() - img[0].float()).abs().max().item() if proj.shape == img[0].shape else None
+        raise SanityCheckError(
+            f"layer-0 hidden states at positions 1..{N_IMAGE_PATCHES} do not match the "
+            f"projector output (shapes {tuple(proj.shape)} vs {tuple(img[0].shape)}, "
+            f"max abs diff {diff})")
+
+
+def patch_lens_for_step(img, norm, head, allowed, cand_ids_t, k=PATCH_TOPK):
+    """
+    Logit lens on the image patches: img [L+1, 256, d] through the final norm
+    and output layer, at every layer, over the TEXT vocabulary only (`allowed`
+    masks out special tokens, the 256 action bins and the padding rows).
+    Same norm gotcha as lens_for_step: the last hidden state is already normed.
+
+    Returns numpy arrays:
+        top_ids    [L+1, 256, k]  int16    the k most likely words
+        top_logp   [L+1, 256, k]  float16  their log-probabilities
+        cand_rank  [L+1, 256, C]  uint16   rank of each candidate word (0 = top)
+        cand_logp  [L+1, 256, C]  float16  its log-probability
+    """
+    import torch
+    n_lay = img.shape[0]
+    top_ids, top_logp, cand_rank, cand_logp = [], [], [], []
+    with torch.no_grad():
+        for l in range(n_lay):
+            x = img[l] if l == n_lay - 1 else norm(img[l])
+            logp = torch.log_softmax(
+                head(x).float().masked_fill(~allowed, float("-inf")), dim=-1)  # [256, V]
+            t = logp.topk(k, dim=-1)
+            c = logp[:, cand_ids_t]                                            # [256, C]
+            r = torch.stack([(logp > c[:, j:j + 1]).sum(-1) for j in range(c.shape[1])], dim=1)
+            top_ids.append(t.indices.to(torch.int16))
+            top_logp.append(t.values.half())
+            cand_rank.append(r.to(torch.int32))
+            cand_logp.append(c.half())
+    stack = lambda xs: torch.stack(xs).cpu().numpy()
+    return (stack(top_ids), stack(top_logp),
+            stack(cand_rank).astype(np.uint16), stack(cand_logp))
 
 
 def verify_against_predict_action(model, inputs, unnorm_key, action_ours):
@@ -516,7 +598,8 @@ def run_rollouts(args):
     assert unnorm_key in model.norm_stats, f"{unnorm_key} not in {list(model.norm_stats)}"
     print(f"[info] unnorm_key = {unnorm_key}")
 
-    record = args.mode == "lens"
+    record = args.mode in ("lens", "patchlens")
+    patch = args.mode == "patchlens"
     if record:
         ids = action_token_ids(model, processor)
         ids_t = torch.as_tensor(ids, device=device)
@@ -524,13 +607,28 @@ def run_rollouts(args):
         if norm is None:
             raise SanityCheckError("no final norm found; the logit lens needs it")
         n_layers = len(find_decoder_layers(model))
+    if patch:
+        # Text vocabulary = everything below the action bins, minus <unk> <s> </s>.
+        allowed = torch.zeros(head.out_features, dtype=torch.bool, device=device)
+        allowed[3:int(ids.min())] = True
+        tok = processor.tokenizer
+        cand_ids = [tok.convert_tokens_to_ids(t) for t in PATCH_CANDIDATES]
+        bad = [t for t, i in zip(PATCH_CANDIDATES, cand_ids)
+               if i is None or i == tok.unk_token_id or not allowed[i]]
+        if bad:
+            raise SanityCheckError(f"candidate words not single text tokens: {bad}")
+        cand_ids_t = torch.as_tensor(cand_ids, device=device)
+        print(f"[info] patch lens: {int(allowed.sum())} text tokens allowed, "
+              f"{len(cand_ids)} candidate words {dict(zip(PATCH_CANDIDATES, cand_ids))}")
 
     suite = benchmark.get_benchmark_dict()[args.suite]()
     tasks = [t for t in args.task_list if t < suite.n_tasks]
     max_steps = args.max_steps or MAX_STEPS[args.suite]
 
     csv_path = os.path.join(args.out_dir, "episodes.csv")
-    for sub in ("videos", "lens", "hidden") if record else ("videos",):
+    subs = ["videos"] + (["lens", "hidden"] if record else []) + \
+           (["patchlens", "patch_hidden"] if patch else [])
+    for sub in subs:
         os.makedirs(os.path.join(args.out_dir, sub), exist_ok=True)
     rows = read_episodes_csv(csv_path)
     print(f"[info] {len(rows)} episodes already in {csv_path}")
@@ -548,10 +646,13 @@ def run_rollouts(args):
             stem = episode_stem(task_id, init_idx)
             lens_path = os.path.join(args.out_dir, "lens", stem + ".npz")
             hidden_path = os.path.join(args.out_dir, "hidden", stem + ".npz")
+            patch_path = os.path.join(args.out_dir, "patchlens", stem + ".npz")
+            patch_hidden_path = os.path.join(args.out_dir, "patch_hidden", stem + ".npz")
+            needed = [lens_path, hidden_path] + ([patch_path, patch_hidden_path] if patch else [])
 
             # ---- resume: decide whether this episode is already done ----
             if record:
-                if os.path.isfile(lens_path) and os.path.isfile(hidden_path):
+                if all(os.path.isfile(p) for p in needed):
                     if key not in rows:
                         # Crashed between writing the npz files and the CSV row.
                         meta = np.load(lens_path)
@@ -568,21 +669,38 @@ def run_rollouts(args):
             # ---- per-step recording for --mode lens ----
             rec = {"argmax": [], "kl": [], "entropy": [], "token_ids": [],
                    "hidden": [], "eef_pos": [], "gripper_qpos": [],
-                   "action": [], "action_model": [], "objects": {}}
+                   "action": [], "action_model": [], "objects": {},
+                   "p_top_ids": [], "p_top_logp": [], "p_cand_rank": [], "p_cand_logp": [],
+                   "p_image": [], "p_hidden": [], "p_hidden_steps": []}
 
             def policy_fn(img_224, step):
                 nonlocal n_final_checks
-                inputs = processor(prompt, model_input_image(img_224)).to(device, dtype=dtype)
+                image = model_input_image(img_224)
+                inputs = processor(prompt, image).to(device, dtype=dtype)
                 with torch.no_grad():
                     if not record:
                         return model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
-                    action, token_ids, hidden = generate_with_hidden(model, inputs, unnorm_key)
+                    action, token_ids, hidden, img = generate_with_hidden(
+                        model, inputs, unnorm_key, image_hidden=patch)
                 if hidden.shape[1] != n_layers + 1:
                     raise SanityCheckError(
                         f"expected {n_layers + 1} hidden states, got {hidden.shape[1]}")
                 if step == 0:
                     # Check once per episode, on the first real observation.
                     verify_against_predict_action(model, inputs, unnorm_key, action)
+                    if patch:
+                        verify_patch_positions(model, inputs, img)
+                if patch:
+                    t_ids, t_lp, c_rank, c_lp = patch_lens_for_step(
+                        img, norm, head, allowed, cand_ids_t)
+                    rec["p_top_ids"].append(t_ids)
+                    rec["p_top_logp"].append(t_lp)
+                    rec["p_cand_rank"].append(c_rank)
+                    rec["p_cand_logp"].append(c_lp)
+                    rec["p_image"].append(np.asarray(image, dtype=np.uint8))
+                    if step % PATCH_HIDDEN_EVERY == 0:
+                        rec["p_hidden"].append(img.to(torch.float16).cpu().numpy())
+                        rec["p_hidden_steps"].append(step)
                 argmax, kl, ent = lens_for_step(hidden, norm, head, ids_t, token_ids,
                                                 int(model.vocab_size))
                 n_final_checks += len(token_ids)
@@ -633,6 +751,23 @@ def run_rollouts(args):
                     buckets=(int(model.vocab_size) - 1 - token_ids).astype(np.uint8),
                     task_id=np.int32(task_id), init_idx=np.int32(init_idx),
                     **{f"obj_{k}": np.stack(v) for k, v in rec["objects"].items()})
+            if patch:
+                save_npz_atomic(
+                    patch_hidden_path,
+                    hidden=np.stack(rec["p_hidden"]),                # [S, L+1, 256, d] fp16
+                    steps=np.array(rec["p_hidden_steps"], dtype=np.int32),
+                    task_id=np.int32(task_id), init_idx=np.int32(init_idx))
+                save_npz_atomic(
+                    patch_path,
+                    top_ids=np.stack(rec["p_top_ids"]),              # [T, L+1, 256, k]
+                    top_logp=np.stack(rec["p_top_logp"]),
+                    cand_rank=np.stack(rec["p_cand_rank"]),          # [T, L+1, 256, C]
+                    cand_logp=np.stack(rec["p_cand_logp"]),
+                    cand_tokens=np.array(PATCH_CANDIDATES),
+                    cand_ids=np.array(cand_ids, dtype=np.int32),
+                    image=np.stack(rec["p_image"]),                  # [T, 224, 224, 3] model input
+                    success=np.int8(success), num_steps=np.int32(num_steps),
+                    task_id=np.int32(task_id), init_idx=np.int32(init_idx))
 
             row = {"task_id": task_id, "init_idx": init_idx, "instruction": instruction,
                    "success": int(success), "num_steps": num_steps}
@@ -942,7 +1077,7 @@ def run_probes(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["rollout", "lens", "probe"], required=True)
+    p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens"], required=True)
     p.add_argument("--suite", default="libero_spatial", choices=list(MAX_STEPS))
     p.add_argument("--tasks", default="0-9", help='task ids, e.g. "0-9" or "0,3,5"')
     p.add_argument("--inits", default="0-4", help='init state indices, e.g. "0-4"')
@@ -963,7 +1098,7 @@ def main():
 
     args.task_list = parse_range(args.tasks)
     args.init_list = parse_range(args.inits)
-    if args.dry_run and args.mode in ("rollout", "lens") and not args.analyze:
+    if args.dry_run and args.mode in ("rollout", "lens", "patchlens") and not args.analyze:
         args.task_list, args.init_list, args.max_steps = [0], [0], 20
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"[info] mode {args.mode}{' --analyze' if args.analyze else ''} | "
