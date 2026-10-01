@@ -1,0 +1,51 @@
+task_id,init_idx,instruction,success,num_steps
+0,0,pick up the black bowl between the plate and the ramekin and place it on the plate,1,85
+0,1,pick up the black bowl between the plate and the ramekin and place it on the plate,1,141
+0,2,pick up the black bowl between the plate and the ramekin and place it on the plate,1,85
+0,3,pick up the black bowl between the plate and the ramekin and place it on the plate,1,190
+0,4,pick up the black bowl between the plate and the ramekin and place it on the plate,1,81
+1,0,pick up the black bowl next to the ramekin and place it on the plate,1,114
+1,1,pick up the black bowl next to the ramekin and place it on the plate,1,105
+1,2,pick up the black bowl next to the ramekin and place it on the plate,1,130
+1,3,pick up the black bowl next to the ramekin and place it on the plate,1,146
+1,4,pick up the black bowl next to the ramekin and place it on the plate,1,122
+2,0,pick up the black bowl from table center and place it on the plate,0,220
+2,1,pick up the black bowl from table center and place it on the plate,1,112
+2,2,pick up the black bowl from table center and place it on the plate,1,102
+2,3,pick up the black bowl from table center and place it on the plate,1,98
+2,4,pick up the black bowl from table center and place it on the plate,1,129
+3,0,pick up the black bowl on the cookie box and place it on the plate,1,82
+3,1,pick up the black bowl on the cookie box and place it on the plate,1,94
+3,2,pick up the black bowl on the cookie box and place it on the plate,1,86
+3,3,pick up the black bowl on the cookie box and place it on the plate,1,95
+3,4,pick up the black bowl on the cookie box and place it on the plate,1,86
+4,0,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate,1,131
+4,1,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate,1,139
+4,2,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate,0,220
+4,3,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate,0,220
+4,4,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate,1,136
+5,0,pick up the black bowl on the ramekin and place it on the plate,1,102
+5,1,pick up the black bowl on the ramekin and place it on the plate,1,91
+5,2,pick up the black bowl on the ramekin and place it on the plate,1,83
+5,3,pick up the black bowl on the ramekin and place it on the plate,1,83
+5,4,pick up the black bowl on the ramekin and place it on the plate,1,87
+6,0,pick up the black bowl next to the cookie box and place it on the plate,1,102
+6,1,pick up the black bowl next to the cookie box and place it on the plate,0,220
+6,2,pick up the black bowl next to the cookie box and place it on the plate,1,102
+6,3,pick up the black bowl next to the cookie box and place it on the plate,1,98
+6,4,pick up the black bowl next to the cookie box and place it on the plate,1,99
+7,0,pick up the black bowl on the stove and place it on the plate,1,106
+7,1,pick up the black bowl on the stove and place it on the plate,1,120
+7,2,pick up the black bowl on the stove and place it on the plate,1,169
+7,3,pick up the black bowl on the stove and place it on the plate,0,220
+7,4,pick up the black bowl on the stove and place it on the plate,1,117
+8,0,pick up the black bowl next to the plate and place it on the plate,1,130
+8,1,pick up the black bowl next to the plate and place it on the plate,1,122
+8,2,pick up the black bowl next to the plate and place it on the plate,0,220
+8,3,pick up the black bowl next to the plate and place it on the plate,1,109
+8,4,pick up the black bowl next to the plate and place it on the plate,0,220
+9,0,pick up the black bowl on the wooden cabinet and place it on the plate,1,121
+9,1,pick up the black bowl on the wooden cabinet and place it on the plate,0,220
+9,2,pick up the black bowl on the wooden cabinet and place it on the plate,1,118
+9,3,pick up the black bowl on the wooden cabinet and place it on the plate,1,123
+9,4,pick up the black bowl on the wooden cabinet and place it on the plate,1,129
