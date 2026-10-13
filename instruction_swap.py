@@ -82,8 +82,9 @@ def collect(args):
     n_layers = len(find_decoder_layers(model))
     norm, head = get_final_norm_and_head(model)
     ids = action_token_ids(model, processor)                       # bucket b -> token id
-    W_action = head.weight[torch.as_tensor(ids, device=head.weight.device)].float().cpu().numpy()
-    norm_w = norm.weight.float().cpu().numpy() if norm is not None else None
+    # .detach(): weights are nn.Parameters (requires_grad), and numpy() refuses those.
+    W_action = head.weight[torch.as_tensor(ids, device=head.weight.device)].detach().float().cpu().numpy()
+    norm_w = norm.weight.detach().float().cpu().numpy() if norm is not None else None
 
     suite = benchmark.get_benchmark_dict()[args.suite]()
     task = suite.get_task(args.task)
@@ -235,16 +236,22 @@ def analyze(args):
     Q = np.linalg.qr(W.T)[0].T                   # [256, d], orthonormal rows
     chance = Q.shape[0] / d
 
+    # The overall TDNV uses the suite instructions only. An --extra paraphrase is
+    # a near-duplicate of the own instruction on purpose, so its huge R would
+    # dominate the mean. Extras still get their own R curves below.
+    core = np.array([not lab.startswith("extra") for lab in labels])
+    K_core = int(core.sum())
+
     R_all = np.zeros((n_lay, K, K))
     var_all = np.zeros((n_lay, K))
-    tdnv_all = np.zeros(n_lay)                   # one number per layer, all instructions
+    tdnv_all = np.zeros(n_lay)                   # one number per layer, suite instructions
     frac_all = np.zeros((n_lay, K))              # own vs each other instruction
     for l in range(n_lay):
         H_raw = hidden[:, :, l].astype(np.float64)
         H = H_raw if args.raw else remove_mean_normalize(H_raw)
         var, means, R = separability(H)
         R_all[l], var_all[l] = R, var
-        tdnv_all[l] = tdnv(var, means)
+        tdnv_all[l] = tdnv(var[core], means[core])
         # The readout-geometry question uses the RAW residual stream, because
         # that is what the final norm and lm_head actually act on.
         raw_means = H_raw.mean(axis=1)
@@ -257,8 +264,8 @@ def analyze(args):
     tag = f"task{args.task}" + ("_raw" if args.raw else "")
     feat = "raw features" if args.raw else "centered + unit-norm features"
 
-    # 0. TDNV over all instructions (the lab's metric, one curve)
-    fig, ax = new_axes(f"TDNV across {K} instructions ({tag}, N={N} images, {feat})",
+    # 0. TDNV over the suite instructions (the lab's metric, one curve)
+    fig, ax = new_axes(f"TDNV across {K_core} instructions ({tag}, N={N} images, {feat})",
                        "TDNV (log scale)")
     ax.plot(layers[1:], tdnv_all[1:], color="#2a78d6", linewidth=2.2)
     ax.set_yscale("log")
@@ -332,7 +339,8 @@ def analyze(args):
     print(f"[csv]  {out}")
 
     best = int(np.nanargmin(tdnv_all[1:])) + 1
-    print(f"\n[TDNV] minimum {tdnv_all[best]:.4f} at layer {best} ({feat})")
+    print(f"\n[TDNV] minimum {tdnv_all[best]:.4f} at layer {best} "
+          f"({K_core} suite instructions, extras excluded; {feat})")
     print(f"[summary] own instruction: {D['instructions'][0]}")
     print(f"{'pair':16s} {'R@L' + str(lay):>9s} {'min R':>8s} {'@layer':>6s} {'action changed':>15s}")
     for r in rows:
