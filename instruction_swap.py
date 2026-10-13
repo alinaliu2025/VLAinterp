@@ -214,8 +214,11 @@ def tdnv(var, means):
 
 def action_subspace_fraction(diff, W_eff_basis):
     """Fraction of ||diff||^2 inside the span of the action readout directions."""
+    total = (diff ** 2).sum()
+    if total == 0:                  # layer 0: every instruction ends in the same token
+        return float("nan")
     proj = W_eff_basis @ diff
-    return float((proj ** 2).sum() / (diff ** 2).sum())
+    return float((proj ** 2).sum() / total)
 
 
 def analyze(args):
