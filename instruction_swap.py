@@ -234,9 +234,12 @@ def analyze(args):
     # each coordinate by norm_w before lm_head, so the effective readout rows
     # are W_action * norm_w.
     W = D["W_action"].astype(np.float64)
+    Q_post = np.linalg.qr(W.T)[0].T              # [256, d], orthonormal rows
     if D["norm_w"].size:
         W = W * D["norm_w"].astype(np.float64)[None]
-    Q = np.linalg.qr(W.T)[0].T                   # [256, d], orthonormal rows
+    Q = np.linalg.qr(W.T)[0].T
+    # The last readout is already AFTER the final norm (same gotcha as
+    # lens_for_step), so lm_head reads it with W_action alone.
     chance = Q.shape[0] / d
 
     # The overall TDNV uses the suite instructions only. An --extra paraphrase is
@@ -258,8 +261,9 @@ def analyze(args):
         # The readout-geometry question uses the RAW residual stream, because
         # that is what the final norm and lm_head actually act on.
         raw_means = H_raw.mean(axis=1)
+        basis = Q_post if l == n_lay - 1 else Q
         for k in range(1, K):
-            frac_all[l, k] = action_subspace_fraction(raw_means[0] - raw_means[k], Q)
+            frac_all[l, k] = action_subspace_fraction(raw_means[0] - raw_means[k], basis)
 
     plots = os.path.join(args.out_dir, "plots")
     os.makedirs(plots, exist_ok=True)
