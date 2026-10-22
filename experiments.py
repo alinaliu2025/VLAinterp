@@ -9,6 +9,10 @@ Batch experiments on OpenVLA + LIBERO, built on top of singleVLA.py.
     --mode probe            ridge probes on the saved hidden states (CPU, no model)
     --mode patchlens        --mode lens, plus a logit lens on the 256 image-patch
                             positions over the text vocabulary (perception)
+    --mode tunedlens        tuned lens: train a per-layer affine translator in front
+                            of the frozen read-out on saved hidden states (GPU, no
+                            rollouts); --src_dir points at the --mode lens run
+    --mode tunedlens --analyze   replot saved translator results (CPU)
 
 Modes say WHAT the script does. Runs are numbered jobs (run0, run1, ...), each
 with its own folder runs/runN/ passed as --out_dir; see runs/RUNS.md.
@@ -39,7 +43,9 @@ Output layout (out_dir is required, e.g. runs/run1):
     hidden/task{t}_init{i}.npz            --mode lens
     patchlens/task{t}_init{i}.npz         --mode patchlens
     patch_hidden/task{t}_init{i}.npz      --mode patchlens (every PATCH_HIDDEN_EVERY steps)
-    plots/                                --analyze and --mode probe
+    plots/                                --analyze, --mode probe, --mode tunedlens
+    tunedlens/readout.npz                 --mode tunedlens: cached lm_head action rows + final norm
+    tunedlens/results.npz                 --mode tunedlens: metrics, out-of-fold argmax
 """
 
 import argparse
@@ -968,7 +974,7 @@ def run_probes(args):
     from sklearn.linear_model import RidgeCV
     from sklearn.model_selection import GroupKFold
 
-    H, groups, targets = load_hidden_dataset(args.out_dir)
+    H, groups, targets = load_hidden_dataset(args.src_dir or args.out_dir)
     n_layers = H.shape[1]
     alphas = np.logspace(-1, 5, 13)
 
@@ -1073,19 +1079,540 @@ def run_probes(args):
 
 
 # ---------------------------------------------------------------------------
+# --mode tunedlens: per-layer affine translators on saved hidden states (GPU)
+# ---------------------------------------------------------------------------
+#
+# Tuned lens (Belrose et al. 2023, arXiv:2303.08112) on the first-action-token
+# position (the one that produces x), using the hidden states --mode lens saved.
+# For every layer l < L, train a translator A_l x + b_l in front of the FROZEN
+# final RMSNorm and the 256 action rows of the FROZEN lm_head, to match the
+# model's own final distribution over the 256 buckets: KL(P_final || P_lens).
+# Nothing in OpenVLA is trained. A_l starts at the identity, so before training
+# the tuned lens IS the logit lens.
+#
+# Translator variants (capacity ladder; read conclusions off what is stable):
+#   bias         A = I, only b_l
+#   r8/r32/r128  A = I + U V^T, rank 8/32/128 (V starts at 0)
+#   full         A = I + M, M a full d x d matrix (starts at 0)
+#   r32_shuffled r32 trained on targets permuted across steps: a control that
+#                should score at the most-common-bucket baseline
+#
+# Evaluation is always on held-out episodes (k folds by episode, out-of-fold
+# predictions pooled), with early stopping on a validation slice of the
+# training episodes.
+
+TL_VARIANTS = "bias,r8,r32,r128,full,r32_shuffled"
+TL_MAIN_VARIANT = "r32"            # the headline curve in the gap plot
+
+
+def episode_folds(groups, k):
+    """Round-robin episodes into k folds. Returns [(train_idx, test_idx)]."""
+    eps = np.unique(groups)
+    fold_of = {e: i % k for i, e in enumerate(eps)}
+    f = np.array([fold_of[g] for g in groups])
+    return [(np.flatnonzero(f != i), np.flatnonzero(f == i)) for i in range(k)]
+
+
+def split_val(train_idx, groups, every=8):
+    """Every `every`-th training episode becomes the early-stopping validation set."""
+    eps = np.unique(groups[train_idx])
+    val_eps = set(eps[::every])
+    is_val = np.array([groups[i] in val_eps for i in train_idx])
+    return train_idx[~is_val], train_idx[is_val]
+
+
+def bucket_argmax(logits):
+    """
+    Argmax over buckets with greedy generate()'s tie-break: first max in
+    TOKEN-ID order, i.e. the HIGHEST bucket among exact ties (see lens_for_step).
+    """
+    n = logits.shape[-1]
+    return (n - 1) - logits.flip(-1).argmax(dim=-1)
+
+
+def load_tunedlens_data(src_dir):
+    """
+    hidden/*.npz from a --mode lens run. Returns
+        H        [N, L+1, d] float16  first-action-token position, all layers
+        final    [N] int              bucket the model actually generated for x
+        groups   [N] int              episode index
+        lens_am  [N, L+1] int or None the recorded logit-lens argmax for x
+    """
+    files = sorted(glob.glob(os.path.join(src_dir, "hidden", "*.npz")))
+    if len(files) < 2:
+        sys.exit(f"[error] need hidden states from >= 2 episodes in {src_dir}/hidden "
+                 f"(found {len(files)}); run --mode lens first")
+    H, final, groups, lens_am = [], [], [], []
+    for ep, fpath in enumerate(files):
+        d = np.load(fpath)
+        H.append(d["hidden"])
+        final.append(d["buckets"][:, 0].astype(np.int64))
+        groups.append(np.full(len(d["hidden"]), ep))
+        lpath = os.path.join(src_dir, "lens", os.path.basename(fpath))
+        if lens_am is not None and os.path.isfile(lpath):
+            lens_am.append(np.load(lpath)["argmax"][:, 0, :].astype(np.int64))
+        else:
+            lens_am = None
+    H = np.concatenate(H)
+    print(f"[info] {len(files)} episodes, {len(H)} steps, hidden {H.shape[1:]} "
+          f"({H.nbytes / 1e9:.1f} GB in RAM)")
+    return (H, np.concatenate(final), np.concatenate(groups),
+            None if lens_am is None else np.concatenate(lens_am))
+
+
+def tunedlens_readout(args, device):
+    """
+    The frozen read-out the lens needs: the 256 action rows of lm_head (row b =
+    bucket b) and the final RMSNorm. Pulled from the model once and cached in
+    out_dir/tunedlens/readout.npz (about 4 MB), so reruns skip the model load.
+    """
+    import torch
+    path = os.path.join(args.out_dir, "tunedlens", "readout.npz")
+    if not os.path.isfile(path):
+        from singleVLA import BASE_REPO, get_final_norm_and_head, load_model
+        model_id = args.model_id or f"openvla/openvla-7b-finetuned-{args.suite.replace('_', '-')}"
+        processor, model, _ = load_model(model_id, BASE_REPO, device)
+        ids = action_token_ids(model, processor)
+        norm, head = get_final_norm_and_head(model)
+        if norm is None:
+            raise SanityCheckError("no final norm found; the tuned lens needs it")
+        eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+        if eps is None:
+            raise SanityCheckError(f"can't find the epsilon of {type(norm).__name__}")
+        ids_t = torch.as_tensor(ids, device=head.weight.device)
+        save_npz_atomic(path,
+                        W_act=head.weight[ids_t].float().cpu().numpy(),     # [256, d]
+                        norm_w=norm.weight.float().cpu().numpy(),           # [d]
+                        eps=np.float32(eps), model_id=np.array(model_id))
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        print(f"[info] cached read-out from {model_id} in {path}")
+    r = np.load(path)
+    print(f"[info] read-out <- {path} ({str(r['model_id'])})")
+    return (torch.as_tensor(r["W_act"], device=device),
+            torch.as_tensor(r["norm_w"], device=device), float(r["eps"]))
+
+
+def make_translator(kind, d):
+    import torch
+    import torch.nn as nn
+
+    class Translator(nn.Module):
+        """A x + b with A = I + (low-rank or full) delta. Starts as the identity."""
+        def __init__(self):
+            super().__init__()
+            self.b = nn.Parameter(torch.zeros(d))
+            self.U = self.V = self.M = None
+            if kind.startswith("r"):
+                rank = int(kind[1:].split("_")[0])
+                self.U = nn.Parameter(torch.randn(d, rank) / d ** 0.5)
+                self.V = nn.Parameter(torch.zeros(rank, d))
+            elif kind == "full":
+                self.M = nn.Parameter(torch.zeros(d, d))
+            elif kind != "bias":
+                raise ValueError(f"unknown translator variant {kind!r}")
+
+        def forward(self, x):
+            out = x + self.b
+            if self.U is not None:
+                out = out + (x @ self.U) @ self.V
+            if self.M is not None:
+                out = out + x @ self.M
+            return out
+
+    return Translator()
+
+
+def run_tunedlens(args):
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    src = args.src_dir or args.out_dir
+    out = os.path.join(args.out_dir, "tunedlens")
+    os.makedirs(out, exist_ok=True)
+    set_seed_everywhere(SEED)
+    torch.backends.cuda.matmul.allow_tf32 = False      # keep the fp32 lens exact
+
+    H, final, groups, lens_am = load_tunedlens_data(src)
+    W, norm_w, eps = tunedlens_readout(args, device)
+    n, n_lay, d = H.shape
+    L = n_lay - 1
+    final_t = torch.as_tensor(final, device=device)
+    variants = [v.strip() for v in args.tl_variants.split(",") if v.strip()]
+    layers = list(range(0, L, args.layer_stride))
+
+    def rmsnorm(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * norm_w
+
+    def logp_of(x_normed):
+        return torch.log_softmax(x_normed @ W.T, dim=-1)
+
+    def batched(fn, X, bs=2048):
+        return torch.cat([fn(X[i:i + bs]) for i in range(0, len(X), bs)])
+
+    # ---- targets: the model's own final distribution over the 256 buckets ----
+    # hidden_states[L] is ALREADY through the final RMSNorm (see lens_for_step).
+    with torch.no_grad():
+        logp_final = batched(logp_of, torch.as_tensor(H[:, L], device=device).float())
+    fb = bucket_argmax(logp_final)
+    mismatch = int((fb != final_t).sum())
+    print(f"[check] fp32 final-layer bucket == generated bucket on "
+          f"{n - mismatch}/{n} steps")
+    if mismatch > max(1, n // 200):
+        raise SanityCheckError(
+            f"fp32 read-out disagrees with the generated x bucket on {mismatch}/{n} "
+            "steps; the cached read-out or the saved position is wrong")
+
+    # SANITY: layer 0 at this position is the embedding of the "▁" token that
+    # ends every prompt, so it must be identical at every step.
+    h0 = torch.as_tensor(H[:, 0], device=device).float()
+    if float((h0 - h0[0]).abs().max()) > 1e-3:
+        raise SanityCheckError(
+            "layer-0 hidden state varies across steps; this is not the "
+            "first-action-token position")
+    del h0
+
+    def metrics(lp, sel=None):
+        """lp: [m, 256] lens log-probs for the steps in sel."""
+        sel = slice(None) if sel is None else sel
+        p_f, f = logp_final[sel], final_t[sel]
+        am = bucket_argmax(lp)
+        dist = (am - f).abs().float()
+        return {"agree": (am == f).float().mean().item(),
+                "within5": (dist <= 5).float().mean().item(),
+                "within25": (dist <= 25).float().mean().item(),
+                "dist": dist.mean().item(),
+                "kl": (p_f.exp() * (p_f - lp)).sum(-1).mean().item(),
+                "entropy": -(lp.exp() * lp).sum(-1).mean().item()}, am
+
+    names = ["agree", "within5", "within25", "dist", "kl", "entropy"]
+
+    # ---- logit lens (identity translator), every layer, no training ----
+    logit = {k: np.zeros(n_lay) for k in names}
+    with torch.no_grad():
+        for l in range(n_lay):
+            X = torch.as_tensor(H[:, l], device=device).float()
+            lp = batched(lambda x: logp_of(x if l == L else rmsnorm(x)), X)
+            m, am = metrics(lp)
+            for k in names:
+                logit[k][l] = m[k]
+            if lens_am is not None and l < L:
+                same = (am.cpu().numpy() == lens_am[:, l]).mean()
+                if same < 0.95:
+                    print(f"[warn] layer {l}: recomputed logit-lens argmax matches the "
+                          f"recorded one on only {same:.1%} of steps")
+    print(f"[info] logit lens agreement: layer 0 {logit['agree'][0]:.3f}, "
+          f"layer {L // 2} {logit['agree'][L // 2]:.3f}, layer {L - 1} {logit['agree'][L - 1]:.3f}")
+
+    # ---- baselines from the training folds, scored out of fold ----
+    folds = episode_folds(groups, args.tl_folds)
+    for tr, te in folds:
+        assert not set(groups[tr]) & set(groups[te]), "fold leaks episodes"
+    base_pred = np.zeros(n, dtype=np.int64)
+    base_lp = torch.zeros_like(logp_final)
+    for tr, te in folds:
+        base_pred[te] = np.bincount(final[tr], minlength=256).argmax()
+        marg = logp_final[tr].exp().mean(0).clamp_min(1e-12)
+        base_lp[te] = (marg / marg.sum()).log()
+    baseline_agree = float((base_pred == final).mean())
+    baseline_kl = metrics(base_lp)[0]["kl"]
+    print(f"[info] most-common-bucket baseline (out of fold): agreement {baseline_agree:.3f}, "
+          f"KL of the marginal {baseline_kl:.3f} nats")
+
+    # ---- train translators ----
+    res = {k: np.full((len(variants), len(layers)), np.nan) for k in names}
+    oof_am = np.zeros((n, len(variants), len(layers)), dtype=np.uint8)
+    epochs_used = np.zeros((len(variants), len(layers), len(folds)), dtype=np.int32)
+    gen = torch.Generator().manual_seed(SEED)
+    t0 = time.time()
+
+    for li, l in enumerate(layers):
+        X_all = torch.as_tensor(H[:, l], device=device).float()
+        for vi, kind in enumerate(variants):
+            shuffled = kind.endswith("_shuffled")
+            lp_oof = torch.zeros_like(logp_final)
+            for fi, (tr, te) in enumerate(folds):
+                tr_fit, va = split_val(tr, groups)
+                # One constant scale per layer from the training steps keeps the
+                # map affine while putting every layer on a similar scale; the
+                # final RMSNorm is scale-invariant, so the identity is unchanged.
+                s = float(torch.rsqrt(X_all[tr].pow(2).mean()))
+                Xs = X_all * s
+                y_fit, y_va = logp_final[tr_fit], logp_final[va]
+                if shuffled:
+                    y_fit = y_fit[torch.randperm(len(tr_fit), generator=gen).to(device)]
+                    y_va = y_va[torch.randperm(len(va), generator=gen).to(device)]
+                T = make_translator(kind, d).to(device)
+                # Weight decay on the delta pulls A back toward the identity.
+                decay = [p for nm, p in T.named_parameters() if nm != "b"]
+                groups_opt = [{"params": [T.b], "weight_decay": 0.0}]
+                if decay:
+                    groups_opt.append({"params": decay, "weight_decay": args.tl_wd})
+                opt = torch.optim.AdamW(groups_opt, lr=args.tl_lr)
+
+                def kl(lp_target, x):
+                    lq = logp_of(rmsnorm(T(x)))
+                    return (lp_target.exp() * (lp_target - lq)).sum(-1).mean()
+
+                Xf, Xv = Xs[tr_fit], Xs[va]
+                best, best_state, bad, ep = float("inf"), None, 0, 0
+                for ep in range(1, args.tl_epochs + 1):
+                    perm = torch.randperm(len(tr_fit), generator=gen).to(device)
+                    for i in range(0, len(perm), args.tl_batch):
+                        idx = perm[i:i + args.tl_batch]
+                        loss = kl(y_fit[idx], Xf[idx])
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        opt.step()
+                    with torch.no_grad():
+                        v = kl(y_va, Xv).item()
+                    if v < best - 1e-4:
+                        best, bad = v, 0
+                        best_state = {k: t.detach().clone() for k, t in T.state_dict().items()}
+                    else:
+                        bad += 1
+                        if bad >= args.tl_patience:
+                            break
+                T.load_state_dict(best_state)
+                epochs_used[vi, li, fi] = ep
+                with torch.no_grad():
+                    lp_oof[te] = batched(lambda x: logp_of(rmsnorm(T(x))), Xs[te])
+                del T, opt, best_state
+            m, am = metrics(lp_oof)
+            for k in names:
+                res[k][vi, li] = m[k]
+            oof_am[:, vi, li] = am.cpu().numpy().astype(np.uint8)
+        row = "  ".join(f"{v} {res['agree'][vi, li]:.3f}" for vi, v in enumerate(variants))
+        print(f"[layer {l:2d}] agreement: logit {logit['agree'][l]:.3f}  {row}  "
+              f"({(time.time() - t0) / 60:.1f} min)", flush=True)
+        del X_all
+
+    # SANITY: at layer 0 every step has the same input, so no translator can
+    # beat the most-common-bucket baseline on held-out episodes.
+    if 0 in layers:
+        worst = float(np.nanmax(res["agree"][:, layers.index(0)]))
+        if worst > baseline_agree + 0.02:
+            raise SanityCheckError(
+                f"a translator scores {worst:.3f} at layer 0, above the baseline "
+                f"{baseline_agree:.3f}; something leaks across folds")
+
+    save_npz_atomic(os.path.join(out, "results.npz"),
+                    variants=np.array(variants), layers=np.array(layers),
+                    **{f"tl_{k}": v for k, v in res.items()},
+                    **{f"logit_{k}": v for k, v in logit.items()},
+                    baseline_agree=np.float64(baseline_agree),
+                    baseline_kl=np.float64(baseline_kl),
+                    oof_argmax=oof_am, final=final.astype(np.uint8),
+                    groups=groups.astype(np.int32), epochs_used=epochs_used,
+                    n_layers=np.int32(L), src_dir=np.array(src))
+    print(f"[ok] translators trained on {len(layers)} layers x {len(variants)} variants "
+          f"x {len(folds)} folds in {(time.time() - t0) / 60:.1f} min")
+    plot_tunedlens(args.out_dir)
+
+
+def onset(values, layers, level):
+    """First layer whose value reaches `level`, or None."""
+    for l, v in zip(layers, values):
+        if np.isfinite(v) and v >= level:
+            return int(l)
+    return None
+
+
+def plot_tunedlens(out_dir):
+    """Plots and CSVs from tunedlens/results.npz (CPU only), plus the gap plot."""
+    r = np.load(os.path.join(out_dir, "tunedlens", "results.npz"))
+    variants = [str(v) for v in r["variants"]]
+    layers = r["layers"]
+    L = int(r["n_layers"])
+    base = float(r["baseline_agree"])
+    all_layers = np.arange(L + 1)
+    plots = os.path.join(out_dir, "plots")
+    os.makedirs(plots, exist_ok=True)
+
+    def with_final(vals, final_value):
+        """Translator values at `layers`, plus the final layer (no lens needed)."""
+        full = np.full(L + 1, np.nan)
+        full[layers] = vals
+        full[L] = final_value
+        return full
+
+    finals = {"agree": 1.0, "within5": 1.0, "within25": 1.0, "dist": 0.0, "kl": 0.0}
+    for metric in ["agree", "within5", "within25", "dist", "kl"]:
+        cols = {"logit_lens": r[f"logit_{metric}"]}
+        for vi, v in enumerate(variants):
+            cols[v] = with_final(r[f"tl_{metric}"][vi], finals[metric])
+        if metric == "agree":
+            cols["baseline"] = np.full(L + 1, base)
+        if metric == "kl":
+            cols["baseline_marginal"] = np.full(L + 1, float(r["baseline_kl"]))
+        write_layer_csv(os.path.join(plots, f"tunedlens_{metric}.csv"), cols)
+
+    # Translator variants get one ordered warm ramp (capacity), the logit lens
+    # stays neutral, the shuffled control is dotted.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    real = [v for v in variants if not v.endswith("_shuffled")]
+    ramp = dict(zip(real, plt.get_cmap("Oranges")(np.linspace(0.4, 0.95, max(len(real), 1)))))
+
+    def lines(ax, metric):
+        ax.plot(all_layers, r[f"logit_{metric}"], color=MUTED, linewidth=2.2, label="logit lens")
+        for vi, v in enumerate(variants):
+            y = with_final(r[f"tl_{metric}"][vi], finals[metric])
+            m = np.isfinite(y)
+            if v.endswith("_shuffled"):
+                ax.plot(all_layers[m], y[m], color=INK, linestyle=":", linewidth=1.4,
+                        label=f"{v} (control)")
+            else:
+                ax.plot(all_layers[m], y[m], color=ramp[v], linewidth=1.8,
+                        label=f"tuned lens, {v}")
+
+    fig, ax = new_axes("Tuned vs logit lens for x: agreement with the final bucket "
+                       "(held-out episodes)", "fraction of steps where lens argmax = final")
+    lines(ax, "agree")
+    ax.axhline(base, color=MUTED, linestyle="--", linewidth=1.2,
+               label=f"most-common bucket ({base:.2f})")
+    ax.set_ylim(-0.02, 1.02)
+    ax.legend(frameon=False, fontsize=7, ncol=2)
+    save_fig(fig, os.path.join(plots, "tunedlens_agreement.png"))
+
+    fig, ax = new_axes("Tuned vs logit lens for x: KL(P_final || P_lens) (held-out episodes)",
+                       "mean KL (nats)")
+    lines(ax, "kl")
+    ax.axhline(float(r["baseline_kl"]), color=MUTED, linestyle="--", linewidth=1.2,
+               label="marginal distribution")
+    ax.set_ylim(bottom=0)
+    ax.legend(frameon=False, fontsize=7, ncol=2)
+    save_fig(fig, os.path.join(plots, "tunedlens_kl.png"))
+
+    # ---- summary: when does each lens first read the action? ----
+    # gain = (agreement - baseline) / (1 - baseline): 0 = baseline, 1 = always right.
+    def gain(a):
+        return (np.asarray(a) - base) / (1 - base)
+
+    final = r["final"].astype(np.int64)
+    rows = []
+    curves = {"logit_lens": (all_layers, r["logit_agree"])}
+    for vi, v in enumerate(variants):
+        curves[v] = (np.append(layers, L), np.append(r["tl_agree"][vi], 1.0))
+    for name, (ls, a) in curves.items():
+        settle = ""
+        if name != "logit_lens" and np.array_equal(layers, np.arange(L)):
+            # Settle layer: first layer from which every later layer picks the final bucket.
+            am = r["oof_argmax"][:, variants.index(name), :].astype(np.int64)
+            ok = np.concatenate([am == final[:, None], np.ones((len(final), 1), bool)], axis=1)
+            settle_l = L - np.cumprod(ok[:, ::-1], axis=1).sum(1) + 1
+            settle = f"{np.median(settle_l):.0f}"
+        rows.append([name, f"{a[0]:.4f}", onset(a, ls, base + 0.05),
+                     onset(gain(a), ls, 0.5), settle])
+    summary = os.path.join(plots, "tunedlens_summary.csv")
+    with open(summary, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["lens", "layer0_agreement", "first_layer_beats_baseline_by_5pts",
+                    "first_layer_half_way_to_perfect", "median_settle_layer"])
+        w.writerows(rows)
+    print(f"[csv]  {summary}  (baseline {base:.4f})")
+    for row in rows:
+        print(f"  {row[0]:14s} layer0 {row[1]}  beats baseline+5pts at {row[2]}  "
+              f"half-way at {row[3]}  median settle {row[4] or '-'}")
+
+    plot_gap(out_dir, curves, base, L)
+
+
+def plot_gap(out_dir, curves, base, L):
+    """
+    Perception vs action on ONE residual stream (the first-action-token
+    position): ridge-probe R^2 for scene state (from --mode probe, same out_dir)
+    against the tuned lens's gain over the baseline. Both are on a 0..1 scale.
+    """
+    plots = os.path.join(out_dir, "plots")
+    probe_csv = os.path.join(plots, "probe_r2.csv")
+    if not os.path.isfile(probe_csv):
+        print(f"[info] no {probe_csv}; run --mode probe with this --out_dir for the gap plot")
+        return
+    with open(probe_csv) as f:
+        rd = list(csv.DictReader(f))
+    p_layers = np.array([int(x["layer"]) for x in rd])
+    probes = {k: np.array([float(x[k]) if x[k] not in ("", "nan") else np.nan for x in rd])
+              for k in rd[0] if k != "layer"}
+    percep = {k: v for k, v in probes.items() if not k.startswith("action_")}
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = new_axes("Perception vs action at the first-action-token position",
+                       "probe R²  /  tuned-lens gain over baseline")
+    blues = plt.get_cmap("Blues")(np.linspace(0.45, 0.95, max(len(percep), 1)))
+    p_onsets = []
+    for c, (k, v) in zip(blues, percep.items()):
+        m = np.isfinite(v)
+        ax.plot(p_layers[m], v[m], color=c, linewidth=1.4, label=f"probe: {k}")
+        if np.nanmax(v) > 0:
+            p_onsets.append(onset(v, p_layers, 0.8 * np.nanmax(v)))
+    if "action_x" in probes:
+        v = probes["action_x"]
+        m = np.isfinite(v)
+        ax.plot(p_layers[m], v[m], color="#eb6834", linestyle="--", linewidth=1.4,
+                label="probe: executed x (ground truth)")
+    for name, color, style in [("logit_lens", MUTED, "-"), (TL_MAIN_VARIANT, "#b23a0e", "-"),
+                               ("full", "#eda100", "-")]:
+        if name in curves:
+            ls, a = curves[name]
+            g = (np.asarray(a) - base) / (1 - base)
+            ax.plot(ls, g, color=color, linestyle=style, linewidth=2.4,
+                    label=("logit lens" if name == "logit_lens" else f"tuned lens, {name}") + " gain")
+    p_onsets = [o for o in p_onsets if o is not None]
+    P = int(np.median(p_onsets)) if p_onsets else None
+    A = None
+    if TL_MAIN_VARIANT in curves:
+        ls, a = curves[TL_MAIN_VARIANT]
+        A = onset((np.asarray(a) - base) / (1 - base), ls, 0.5)
+    # P and A get their own colour and height so they stay readable when equal.
+    for x, lab, color, y in [(P, "P (perception)", "#08519c", 0.98),
+                             (A, "A (action)", "#b23a0e", 0.88)]:
+        if x is not None:
+            ax.axvline(x, color=color, linestyle=":", linewidth=1.2)
+            ax.text(x + 0.3, y, lab, color=color, fontsize=9, va="top")
+    ax.set_ylim(-0.3, 1.02)
+    ax.set_xlim(0, L)
+    ax.axhline(0, color=MUTED, linewidth=0.8)
+    ax.legend(frameon=False, fontsize=7, ncol=2, bbox_to_anchor=(1.01, 1), loc="upper left")
+    fig.set_size_inches(11, 5)
+    save_fig(fig, os.path.join(plots, "gap_perception_action.png"))
+
+    path = os.path.join(plots, "gap_summary.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["quantity", "layer", "definition"])
+        w.writerow(["P", "" if P is None else P,
+                    "median over perception probes of the first layer reaching 80% of that probe's max R^2"])
+        w.writerow(["A", "" if A is None else A,
+                    f"first layer where the {TL_MAIN_VARIANT} tuned lens is half-way from the "
+                    "most-common-bucket baseline to perfect agreement"])
+        w.writerow(["gap", "" if P is None or A is None else A - P, "A - P"])
+    print(f"[csv]  {path}  P={P} A={A}")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens"], required=True)
+    p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens", "tunedlens"],
+                   required=True)
     p.add_argument("--suite", default="libero_spatial", choices=list(MAX_STEPS))
     p.add_argument("--tasks", default="0-9", help='task ids, e.g. "0-9" or "0,3,5"')
     p.add_argument("--inits", default="0-4", help='init state indices, e.g. "0-4"')
     p.add_argument("--out_dir", required=True,
                    help="this run's folder, e.g. runs/run1")
     p.add_argument("--save_video", action="store_true")
+    p.add_argument("--src_dir", default=None,
+                   help="--mode probe/tunedlens: read hidden/ (and lens/) from this run's "
+                        "folder instead of --out_dir, e.g. runs/run2")
     p.add_argument("--analyze", action="store_true",
-                   help="with --mode lens: plot saved lens data, no model load")
+                   help="with --mode lens: plot saved lens data, no model load; with "
+                        "--mode tunedlens: replot saved translator results")
     p.add_argument("--dry_run", action="store_true",
                    help="1 task, 1 init, 20 steps")
     p.add_argument("--model_id", default=None,
@@ -1093,7 +1620,19 @@ def main():
     p.add_argument("--max_steps", type=int, default=None,
                    help="override the official per-suite step budget")
     p.add_argument("--layer_stride", type=int, default=1,
-                   help="--mode probe: probe every Nth layer (1 = all)")
+                   help="--mode probe/tunedlens: every Nth layer (1 = all)")
+    p.add_argument("--tl_variants", default=TL_VARIANTS,
+                   help="--mode tunedlens: comma-separated translator variants")
+    p.add_argument("--tl_folds", type=int, default=5,
+                   help="--mode tunedlens: cross-validation folds (by episode)")
+    p.add_argument("--tl_epochs", type=int, default=60,
+                   help="--mode tunedlens: max epochs per translator")
+    p.add_argument("--tl_patience", type=int, default=5,
+                   help="--mode tunedlens: early-stopping patience in epochs")
+    p.add_argument("--tl_lr", type=float, default=1e-3)
+    p.add_argument("--tl_wd", type=float, default=1e-2,
+                   help="--mode tunedlens: weight decay on the translator delta")
+    p.add_argument("--tl_batch", type=int, default=512)
     args = p.parse_args()
 
     args.task_list = parse_range(args.tasks)
@@ -1106,6 +1645,8 @@ def main():
 
     if args.mode == "probe":
         run_probes(args)
+    elif args.mode == "tunedlens":
+        plot_tunedlens(args.out_dir) if args.analyze else run_tunedlens(args)
     elif args.mode == "lens" and args.analyze:
         analyze_lens(args)
     else:
