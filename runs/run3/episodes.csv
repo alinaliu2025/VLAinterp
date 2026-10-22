@@ -1,0 +1,6 @@
+task_id,init_idx,instruction,success,num_steps
+0,0,pick up the black bowl between the plate and the ramekin and place it on the plate,1,85
+0,1,pick up the black bowl between the plate and the ramekin and place it on the plate,1,141
+0,2,pick up the black bowl between the plate and the ramekin and place it on the plate,1,85
+0,3,pick up the black bowl between the plate and the ramekin and place it on the plate,1,190
+0,4,pick up the black bowl between the plate and the ramekin and place it on the plate,1,81
