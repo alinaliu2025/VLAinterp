@@ -1181,8 +1181,8 @@ def tunedlens_readout(args, device):
             raise SanityCheckError(f"can't find the epsilon of {type(norm).__name__}")
         ids_t = torch.as_tensor(ids, device=head.weight.device)
         save_npz_atomic(path,
-                        W_act=head.weight[ids_t].float().cpu().numpy(),     # [256, d]
-                        norm_w=norm.weight.float().cpu().numpy(),           # [d]
+                        W_act=head.weight[ids_t].detach().float().cpu().numpy(),   # [256, d]
+                        norm_w=norm.weight.detach().float().cpu().numpy(),         # [d]
                         eps=np.float32(eps), model_id=np.array(model_id))
         del model
         if device == "cuda":
