@@ -71,6 +71,27 @@ At every simulator step, for each of those 7 tokens, we take the model's interna
 
 ## 5. Findings, with the numbers
 
+### 5.0 The two summary charts
+
+Both charts have one panel per action part plus an overlay of all seven. They are averaged **hierarchically**: steps → mean per episode → mean per task (5 episodes) → mean of the 10 tasks, so every task counts equally. (The tables below pool all steps instead, which gives slightly more weight to failed episodes, because they always run the full 220 steps. That's why baseline crossings can differ by a layer between the charts and the tables.)
+
+- **Blue line:** mean over tasks.
+- **Shaded band:** range of the 10 task means.
+- **Dashed gray line:** score of "always guess the most common bin."
+- **Dot:** first layer that beats that guess.
+
+Successful-only and all-episode curves differ by under 3 percentage points at every layer, so the charts use all 50 episodes. `--success_only` makes the other version.
+
+![Exact agreement by layer, per action part](../runs/run2/plots/fig_dof_agreement.png)
+
+**Exact agreement** (% of steps where the layer picks the final bin). Movement parts stay near 0% until about layer 16 and beat the baseline only at layers 25–28. The gripper beats its baseline at layer 19.
+
+![Distance from final bin by layer, per action part](../runs/run2/plots/fig_dof_distance.png)
+
+**Distance from the final bin** (as % of each part's range; lower = closer). This captures "getting closer" even when the bin isn't exact. From layer 1 to 16, every part is 23–44% of its range away from the answer (most parts 28–37%). Movement becomes *roughly* right a few layers before it becomes *exactly* right: on distance, x and y beat the baseline at layer 24 and z at layer 18.
+
+Made by `python lens_figures.py runs/run2`; the plotted numbers are in `runs/run2/plots/fig_dof_summary.csv`.
+
 ### 5.1 Layers 0–16: no readable action
 
 Exact agreement for every movement part stays at **0.1–0.9%** through layer 16, which is at the 1-in-256 chance level. Even "roughly right" (±10% of the range) is only 9–24%.
@@ -200,6 +221,7 @@ Movement parts pooled (x through yaw):
 # on OSC (needs the run's lens/ folder, which is not in git)
 python experiments.py --mode lens --analyze --out_dir runs/run2
 python lens_report.py runs/run2 --csv
+python lens_figures.py runs/run2            # add --success_only for successful episodes only
 ```
 
 - **Outputs in git:**
