@@ -221,6 +221,52 @@ def action_subspace_fraction(diff, W_eff_basis):
     return float((proj ** 2).sum() / total)
 
 
+def variance_split(H):
+    """
+    Two-way split of the total variance of H [K, N, d] (instruction x image):
+        h_kn = grand + a_k (instruction) + b_n (image) + e_kn (the rest: how this
+        instruction and this image combine).
+    Returns the three shares of the total sum of squares; they add to 1.
+    TDNV's spread (mean Var_k) is the image + rest part; its separation is the
+    instruction part.
+    """
+    K, N = H.shape[:2]
+    grand = H.mean(axis=(0, 1))
+    a = H.mean(axis=1) - grand                   # [K, d]
+    b = H.mean(axis=0) - grand                   # [N, d]
+    e = H - grand - a[:, None] - b[None]
+    ss = np.array([N * (a ** 2).sum(), K * (b ** 2).sum(), (e ** 2).sum()])
+    total = ss.sum()
+    return ss / total if total > 0 else np.full(3, np.nan)
+
+
+def heldout_pair_view(H0, H1, fit, test):
+    """
+    Direction from instruction 0's mean to instruction 1's mean, fit on the images
+    `fit` and scored on the held-out images `test`.
+    Returns (accuracy, x0, y0, x1, y1):
+        accuracy = held-out images on the correct side of the midpoint
+        x        = position along that direction (0 = own mean, 1 = other mean)
+        y        = position along the largest image-driven direction orthogonal
+                   to it, in the same units
+    """
+    m0, m1 = H0[fit].mean(0), H1[fit].mean(0)
+    dist = np.linalg.norm(m1 - m0)
+    if dist == 0:                   # layer 0: every instruction ends in the same token
+        return (float("nan"),) + (None,) * 4
+    u = (m1 - m0) / dist
+    resid = np.concatenate([H0[fit] - m0, H1[fit] - m1])
+    resid -= np.outer(resid @ u, u)
+    v = np.linalg.svd(resid, full_matrices=False)[2][0]
+    x0, x1 = (H0[test] - m0) @ u / dist, (H1[test] - m0) @ u / dist
+    y0, y1 = (H0[test] - m0) @ v / dist, (H1[test] - m0) @ v / dist
+    acc = ((x0 < 0.5).sum() + (x1 >= 0.5).sum()) / (len(x0) + len(x1))
+    return float(acc), x0, y0, x1, y1
+
+
+VIEW_LAYERS = (3, 7, 15, 22, 31)    # layers saved for the 2-D pair scatter
+
+
 def analyze(args):
     path = os.path.join(args.out_dir, "swap", f"task{args.task}.npz")
     if not os.path.isfile(path):
@@ -252,12 +298,30 @@ def analyze(args):
     var_all = np.zeros((n_lay, K))
     tdnv_all = np.zeros(n_lay)                   # one number per layer, suite instructions
     frac_all = np.zeros((n_lay, K))              # own vs each other instruction
+    split_all = np.zeros((n_lay, 3))             # instruction / image / rest shares
+    spread_all = np.zeros(n_lay)                 # TDNV numerator: mean Var_k
+    sep_all = np.zeros(n_lay)                    # TDNV denominator: mean ||mean_k - mean_k'||^2
+    acc_all = np.full((n_lay, K), np.nan)        # held-out own-vs-k accuracy
+    view_rows = []
+    fit, test = slice(0, None, 2), slice(1, None, 2)   # even images fit, odd images score
     for l in range(n_lay):
         H_raw = hidden[:, :, l].astype(np.float64)
         H = H_raw if args.raw else remove_mean_normalize(H_raw)
         var, means, R = separability(H)
         R_all[l], var_all[l] = R, var
         tdnv_all[l] = tdnv(var[core], means[core])
+        split_all[l] = variance_split(H[core])
+        spread_all[l] = var[core].mean()
+        d2 = ((means[core][:, None] - means[core][None]) ** 2).sum(-1)
+        sep_all[l] = d2[~np.eye(K_core, dtype=bool)].mean()
+        for k in range(1, K):
+            acc, x0, y0, x1, y1 = heldout_pair_view(H[0], H[k], fit, test)
+            acc_all[l, k] = acc
+            if l in VIEW_LAYERS and x0 is not None:
+                img_idx = np.arange(N)[test]
+                for grp, xs, ys in (("own", x0, y0), (labels[k], x1, y1)):
+                    view_rows += [(l, f"own_vs_{labels[k]}", grp, n, x, y)
+                                  for n, x, y in zip(img_idx, xs, ys)]
         # The readout-geometry question uses the RAW residual stream, because
         # that is what the final norm and lm_head actually act on.
         raw_means = H_raw.mean(axis=1)
@@ -322,7 +386,50 @@ def analyze(args):
     fig.colorbar(im, ax=ax, label="log10 R  (lower = more separated)")
     save_fig(fig, os.path.join(plots, f"swap_R_matrix_L{lay}_{tag}.png"))
 
-    # 4. behavior: does the ACTION change when only the words change?
+    # 4. why TDNV moves: split the variance into instruction / image / rest
+    fig, ax = new_axes(f"What the hidden state varies with ({tag}, {K_core} instructions x {N} images)",
+                       "share of total variance")
+    ax.stackplot(layers[1:], split_all[1:].T, colors=["#222222", "#888888", "#cccccc"],
+                 labels=["instruction", "image", "rest (instruction x image)"])
+    ax.set_ylim(0, 1)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    save_fig(fig, os.path.join(plots, f"swap_variance_split_{tag}.png"))
+    with np.errstate(invalid="ignore"):          # layer 0: 0 / 0
+        ratio = spread_all / sep_all
+    write_layer_csv(os.path.join(plots, f"swap_variance_split_{tag}.csv"),
+                    {"instruction_share": split_all[:, 0], "image_share": split_all[:, 1],
+                     "rest_share": split_all[:, 2], "spread_mean_var": spread_all,
+                     "separation_mean_dist2": sep_all, "spread_over_separation": ratio})
+
+    # 5. is the instruction still readable late? one direction, held-out images
+    fig, ax = new_axes(f"Own vs other instruction, held-out images ({tag})",
+                       "accuracy along the mean-difference direction")
+    for k in range(1, K):
+        style = "--" if labels[k].startswith("extra") else "-"
+        ax.plot(layers, acc_all[:, k], style, color=cmap(k / max(K - 1, 1)),
+                linewidth=1.5, label=f"own vs {labels[k]}")
+    ax.axhline(0.5, color="#898781", linestyle=":", linewidth=1.2, label="chance (0.5)")
+    ax.set_ylim(0.4, 1.02)
+    ax.legend(frameon=False, fontsize=7, ncol=2)
+    save_fig(fig, os.path.join(plots, f"swap_pair_accuracy_{tag}.png"))
+    write_layer_csv(os.path.join(plots, f"swap_pair_accuracy_{tag}.csv"),
+                    {f"own_vs_{labels[k]}": acc_all[:, k] for k in range(1, K)})
+    out = os.path.join(plots, f"swap_pair_view_{tag}.csv")
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["layer", "pair", "group", "image", "x", "y"])
+        w.writerows((l, p, g, n, f"{x:.4f}", f"{y:.4f}") for l, p, g, n, x, y in view_rows)
+    print(f"[csv]  {out}")
+
+    # 6. a few of the images, exactly as the model saw them
+    if not args.raw:
+        import matplotlib.pyplot as plt
+        for n in range(min(3, N)):
+            img_path = os.path.join(plots, f"scene_task{args.task}_image{n}.png")
+            plt.imsave(img_path, D["images"][n])
+            print(f"[img]  {img_path}")
+
+    # 7. behavior: does the ACTION change when only the words change?
     b, a = D["buckets"].astype(int), D["actions"]
     rows = []
     for k in range(1, K):
@@ -348,6 +455,9 @@ def analyze(args):
     best = int(np.nanargmin(tdnv_all[1:])) + 1
     print(f"\n[TDNV] minimum {tdnv_all[best]:.4f} at layer {best} "
           f"({K_core} suite instructions, extras excluded; {feat})")
+    print(f"[split] shares at layer {best}: instruction {split_all[best, 0]:.2f}, "
+          f"image {split_all[best, 1]:.2f}, rest {split_all[best, 2]:.2f}; "
+          f"at layer {lay}: {split_all[lay, 0]:.2f} / {split_all[lay, 1]:.2f} / {split_all[lay, 2]:.2f}")
     print(f"[summary] own instruction: {D['instructions'][0]}")
     print(f"{'pair':16s} {'R@L' + str(lay):>9s} {'min R':>8s} {'@layer':>6s} {'action changed':>15s}")
     for r in rows:
