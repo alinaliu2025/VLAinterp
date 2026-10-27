@@ -13,6 +13,10 @@ Batch experiments on OpenVLA + LIBERO, built on top of singleVLA.py.
                             of the frozen read-out on saved hidden states (GPU, no
                             rollouts); --src_dir points at the --mode lens run
     --mode tunedlens --analyze   replot saved translator results (CPU)
+    --mode vocablens        logit lens over the FULL vocabulary on saved hidden states:
+                            how much probability goes to words vs action bins at each
+                            layer (GPU, no rollouts); --src_dir as for tunedlens
+    --mode vocablens --analyze   replot saved vocab-lens results (CPU)
 
 Modes say WHAT the script does. Runs are numbered jobs (run0, run1, ...), each
 with its own folder runs/runN/ passed as --out_dir; see runs/RUNS.md.
@@ -46,6 +50,8 @@ Output layout (out_dir is required, e.g. runs/run1):
     plots/                                --analyze, --mode probe, --mode tunedlens
     tunedlens/readout.npz                 --mode tunedlens: cached lm_head action rows + final norm
     tunedlens/results.npz                 --mode tunedlens: metrics, out-of-fold argmax
+    vocablens/readout.npz                 --mode vocablens: cached full lm_head + final norm + token strings
+    vocablens/results.npz                 --mode vocablens: per-step, per-layer group masses, top tokens
 """
 
 import argparse
@@ -1595,11 +1601,379 @@ def plot_gap(out_dir, curves, base, L):
 
 
 # ---------------------------------------------------------------------------
+# --mode vocablens: logit lens over the FULL vocabulary (words vs action bins)
+# ---------------------------------------------------------------------------
+
+# Token-id groups of lm_head, in plot order (see vocablens_groups).
+VL_GROUPS = ["bins", "text", "pad", "special"]
+VL_COLORS = {"bins": "#b23a0e", "text": "#2a78d6", "pad": "#898781", "special": "#4a3aa7"}
+VL_TOPK = 5                       # top text tokens saved per step and layer
+
+
+def vocablens_groups(n_out, vocab, bin_lo):
+    """
+    Group index (into VL_GROUPS) of every lm_head row:
+        special  0..2                <unk> <s> </s>
+        text     3..bin_lo-1         ordinary Llama tokens
+        bins     bin_lo..vocab-1     the 256 action buckets (bucket b = id vocab-1-b)
+        pad      vocab..n_out-1      pad-to-multiple rows; predict_action never decodes them
+    """
+    g = np.full(n_out, VL_GROUPS.index("text"), dtype=np.int64)
+    g[:3] = VL_GROUPS.index("special")
+    g[bin_lo:vocab] = VL_GROUPS.index("bins")
+    g[vocab:] = VL_GROUPS.index("pad")
+    return g
+
+
+def vocablens_readout(args, device):
+    """
+    The full read-out: ALL rows of lm_head (fp16, as in the model), the final
+    RMSNorm, every token's string, and where the action bins start. Pulled from
+    the model once and cached in out_dir/vocablens/readout.npz (about 270 MB).
+    """
+    import torch
+    path = os.path.join(args.out_dir, "vocablens", "readout.npz")
+    if not os.path.isfile(path):
+        from singleVLA import BASE_REPO, get_final_norm_and_head, load_model
+        model_id = args.model_id or f"openvla/openvla-7b-finetuned-{args.suite.replace('_', '-')}"
+        processor, model, _ = load_model(model_id, BASE_REPO, device)
+        ids = action_token_ids(model, processor)
+        norm, head = get_final_norm_and_head(model)
+        if norm is None:
+            raise SanityCheckError("no final norm found; the vocab lens needs it")
+        eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+        if eps is None:
+            raise SanityCheckError(f"can't find the epsilon of {type(norm).__name__}")
+        vocab = int(model.vocab_size)
+        tokens = processor.tokenizer.convert_ids_to_tokens(list(range(vocab)))
+        tokens += [f"<pad{i}>" for i in range(head.out_features - vocab)]
+        save_npz_atomic(path,
+                        W=head.weight.detach().half().cpu().numpy(),             # [n_out, d]
+                        norm_w=norm.weight.detach().float().cpu().numpy(),       # [d]
+                        eps=np.float32(eps), vocab=np.int32(vocab),
+                        bin_lo=np.int32(ids.min()), tokens=np.array(tokens),
+                        model_id=np.array(model_id))
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        print(f"[info] cached full read-out from {model_id} in {path}")
+    r = np.load(path)
+    W = torch.as_tensor(r["W"], device=device).float()
+    print(f"[info] read-out <- {path} ({str(r['model_id'])}): lm_head {tuple(W.shape)}, "
+          f"vocab {int(r['vocab'])}, bins from id {int(r['bin_lo'])}")
+    return (W, torch.as_tensor(r["norm_w"], device=device), float(r["eps"]),
+            int(r["vocab"]), int(r["bin_lo"]))
+
+
+def run_vocablens(args):
+    """
+    Logit lens at the first-action-token position (the one that produces x),
+    every layer, softmaxed over the WHOLE vocabulary instead of only the 256
+    action rows. Answers "is the model choosing a word or an action bin at
+    layer l?" by splitting the probability into VL_GROUPS. Reads a --mode lens
+    run's hidden/ (--src_dir); writes out_dir/vocablens/results.npz.
+    """
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    src = args.src_dir or args.out_dir
+    out = os.path.join(args.out_dir, "vocablens")
+    os.makedirs(out, exist_ok=True)
+    torch.backends.cuda.matmul.allow_tf32 = False      # keep the fp32 lens exact
+
+    H, final, groups, lens_am = load_tunedlens_data(src)
+    W, norm_w, eps, vocab, bin_lo = vocablens_readout(args, device)
+    n, n_lay, d = H.shape
+    L = n_lay - 1
+    n_out = W.shape[0]
+    n_bins = vocab - bin_lo
+    if W.shape[1] != d:
+        raise SanityCheckError(f"lm_head width {W.shape[1]} != hidden size {d}")
+
+    # Step index, episode length and success for every row of H (same file
+    # order as load_tunedlens_data).
+    files = sorted(glob.glob(os.path.join(src, "hidden", "*.npz")))
+    rows = read_episodes_csv(os.path.join(src, "episodes.csv"))
+    ep_success = []
+    for fpath in files:
+        dd = np.load(fpath)
+        row = rows.get((int(dd["task_id"]), int(dd["init_idx"])))
+        ep_success.append(-1 if row is None else int(row["success"]))
+    ep_success = np.array(ep_success, dtype=np.int8)
+    step = np.zeros(n, dtype=np.int32)
+    ep_len = np.zeros(n, dtype=np.int32)
+    for e in np.unique(groups):
+        idx = np.flatnonzero(groups == e)
+        step[idx] = np.arange(len(idx))
+        ep_len[idx] = len(idx)
+
+    grp_np = vocablens_groups(n_out, vocab, bin_lo)
+    grp = torch.as_tensor(grp_np, device=device)
+    masks = [grp == i for i in range(len(VL_GROUPS))]
+    text_mask = masks[VL_GROUPS.index("text")]
+    bin_ids = torch.as_tensor(vocab - 1 - np.arange(n_bins), device=device)  # column b = bucket b
+    gen_ids = vocab - 1 - final
+    gen_ids_t = torch.as_tensor(gen_ids, device=device)
+
+    def rmsnorm(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * norm_w
+
+    mass = np.zeros((n, n_lay, len(VL_GROUPS)), dtype=np.float32)
+    top1 = np.zeros((n, n_lay), dtype=np.int32)
+    entropy = np.zeros((n, n_lay), dtype=np.float32)
+    logp_gen = np.zeros((n, n_lay), dtype=np.float32)
+    text_ids = np.zeros((n, n_lay, VL_TOPK), dtype=np.int32)
+    text_logp = np.zeros((n, n_lay, VL_TOPK), dtype=np.float32)
+    bin_am = np.zeros((n, n_lay), dtype=np.uint8)
+    bin_pmax = np.zeros((n, n_lay), dtype=np.float32)
+
+    bs = 1024
+    with torch.no_grad():
+        for l in range(n_lay):
+            for i in range(0, n, bs):
+                X = torch.as_tensor(H[i:i + bs, l], device=device).float()
+                # hidden_states[L] is ALREADY through the final RMSNorm (see lens_for_step).
+                logits = (X if l == L else rmsnorm(X)) @ W.T              # [b, n_out]
+                lp = torch.log_softmax(logits, dim=-1)
+                s = slice(i, i + len(X))
+                mass[s, l] = torch.stack([torch.logsumexp(lp[:, m], dim=-1) for m in masks],
+                                         dim=-1).exp().cpu().numpy()
+                # torch.argmax returns the first max, i.e. lowest token id, like generate().
+                top1[s, l] = logits.argmax(-1).cpu().numpy()
+                entropy[s, l] = (-(lp.exp() * lp).sum(-1)).cpu().numpy()
+                logp_gen[s, l] = lp.gather(1, gen_ids_t[s, None])[:, 0].cpu().numpy()
+                tl, ti = lp.masked_fill(~text_mask, float("-inf")).topk(VL_TOPK, dim=-1)
+                text_ids[s, l] = ti.cpu().numpy()
+                text_logp[s, l] = tl.cpu().numpy()
+                bl = logits[:, bin_ids]
+                bin_am[s, l] = bucket_argmax(bl).cpu().numpy()
+                bin_pmax[s, l] = torch.log_softmax(bl, -1).max(-1).values.exp().cpu().numpy()
+            print(f"[layer {l:2d}] P(bins) median {np.median(mass[:, l, 0]):.3g} | "
+                  f"P(text) median {np.median(mass[:, l, 1]):.3g} | "
+                  f"top-1 is a bin on {(grp_np[top1[:, l]] == 0).mean():.1%} of steps", flush=True)
+
+    # ---- checks ----
+    total = mass.sum(-1)
+    if np.abs(total - 1).max() > 1e-3:
+        raise SanityCheckError(f"group masses don't sum to 1 (max error {np.abs(total - 1).max():.2g})")
+    bad = int((top1[:, L] != gen_ids).sum())
+    print(f"[check] full-vocab final-layer top-1 == generated token on {n - bad}/{n} steps")
+    if bad > max(1, n // 200):
+        raise SanityCheckError(
+            f"full-vocab top-1 at the final layer disagrees with the generated token on "
+            f"{bad}/{n} steps; the read-out or the saved position is wrong")
+    bad = int((bin_am[:, L] != final).sum())
+    print(f"[check] bins-only final-layer argmax == generated bucket on {n - bad}/{n} steps")
+    if bad > max(1, n // 200):
+        raise SanityCheckError(f"bins-only argmax disagrees with the generated bucket on {bad}/{n} steps")
+    h0 = torch.as_tensor(H[:, 0], device=device).float()
+    if float((h0 - h0[0]).abs().max()) > 1e-3:
+        raise SanityCheckError(
+            "layer-0 hidden state varies across steps; this is not the "
+            "first-action-token position")
+    if lens_am is not None:
+        for l in range(L):
+            same = (bin_am[:, l] == lens_am[:, l]).mean()
+            if same < 0.95:
+                print(f"[warn] layer {l}: bins-only argmax matches the recorded logit lens "
+                      f"on only {same:.1%} of steps")
+
+    row_norm = W.norm(dim=1).cpu().numpy()
+    save_npz_atomic(os.path.join(out, "results.npz"),
+                    mass=mass, top1=top1, top1_group=grp_np[top1].astype(np.int8),
+                    entropy=entropy, logp_gen=logp_gen,
+                    text_ids=text_ids, text_logp=text_logp,
+                    bin_argmax=bin_am, bin_pmax=bin_pmax,
+                    final=final.astype(np.int32), gen_ids=gen_ids.astype(np.int32),
+                    episode=groups.astype(np.int32), step=step, ep_len=ep_len,
+                    success=ep_success[groups],
+                    groups=np.array(VL_GROUPS),
+                    group_sizes=np.array([(grp_np == i).sum() for i in range(len(VL_GROUPS))]),
+                    group_row_norm=np.array([row_norm[grp_np == i].mean()
+                                             for i in range(len(VL_GROUPS))], dtype=np.float32),
+                    vocab=np.int32(vocab), bin_lo=np.int32(bin_lo), n_layers=np.int32(L),
+                    src_dir=np.array(src))
+    print(f"[ok] {os.path.join(out, 'results.npz')}")
+    plot_vocablens(args.out_dir)
+
+
+def plot_vocablens(out_dir):
+    """Plots and CSVs from vocablens/results.npz (CPU only)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    r = np.load(os.path.join(out_dir, "vocablens", "results.npz"))
+    tokens = np.load(os.path.join(out_dir, "vocablens", "readout.npz"))["tokens"]
+    mass, L = r["mass"], int(r["n_layers"])
+    n, n_lay = mass.shape[:2]
+    gi = {g: i for i, g in enumerate(VL_GROUPS)}
+    size = dict(zip(VL_GROUPS, r["group_sizes"].astype(int)))
+    layers = np.arange(n_lay)
+    plots = os.path.join(out_dir, "plots")
+    os.makedirs(plots, exist_ok=True)
+    pb, pt = mass[..., gi["bins"]], mass[..., gi["text"]]
+    q25, q50, q75 = np.percentile(pb, [25, 50, 75], axis=0)
+
+    # Crossover: first layer whose MEDIAN P(bins) passes 0.5. Per step, the
+    # settle layer is the first layer from which P(bins) stays above 0.5.
+    cross = onset(q50, layers, 0.5)
+    below = pb <= 0.5
+    settle = np.where(below.any(1), n_lay - below[:, ::-1].argmax(1), 0).astype(float)
+    settle[below[:, L]] = np.nan                       # never settles (final layer below 0.5)
+
+    # ---- 1. probability mass by group (linear and log) ----
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+    for ax, log in zip(axes, [False, True]):
+        for g in VL_GROUPS:
+            m = mass[..., gi[g]]
+            lo, md, hi = np.percentile(m, [25, 50, 75], axis=0)
+            ax.plot(layers, md, color=VL_COLORS[g], linewidth=2,
+                    label=f"{g} ({size[g]} tokens)")
+            ax.fill_between(layers, lo, hi, color=VL_COLORS[g], alpha=0.18, linewidth=0)
+        if log:
+            chance = size["bins"] / sum(size.values())
+            ax.set_yscale("log")
+            ax.axhline(chance, color=VL_COLORS["bins"], linestyle=":", linewidth=1)
+            ax.text(0.5, chance * 1.3, "bins at chance (uniform)",
+                    color=VL_COLORS["bins"], fontsize=8)
+        else:
+            ax.set_ylim(0, 1.02)
+            ax.axhline(0.5, color=MUTED, linewidth=0.8)
+        if cross is not None:
+            ax.axvline(cross, color=INK, linestyle=":", linewidth=1.2)
+            ax.text(cross + 0.3, 0.97, f"crossover\nlayer {cross}", fontsize=8, va="top",
+                    transform=ax.get_xaxis_transform())
+        ax.set_title(f"Probability mass by token group ({'log' if log else 'linear'} scale)",
+                     loc="left", fontsize=12, color=INK)
+        ax.set_xlabel("layer (0 = embeddings, last = final post-norm)", color=MUTED)
+        ax.set_ylabel("share of full-vocab probability (median, IQR band)", color=MUTED)
+        ax.grid(True, color=GRID, linewidth=0.6)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.set_xlim(0, L)
+    axes[0].legend(frameon=False, fontsize=8, loc="center left")
+    save_fig(fig, os.path.join(plots, "vocablens_mass.png"))
+
+    # ---- 2. what group is the single most likely token in? ----
+    tg = r["top1_group"]
+    frac = {g: (tg == gi[g]).mean(0) for g in VL_GROUPS}
+    fig, ax = new_axes("Group of the top-1 token over the full vocabulary", "fraction of steps")
+    ax.stackplot(layers, *[frac[g] for g in VL_GROUPS], colors=[VL_COLORS[g] for g in VL_GROUPS],
+                 labels=VL_GROUPS, alpha=0.85)
+    ax.set_xlim(0, L)
+    ax.set_ylim(0, 1)
+    ax.legend(frameon=False, fontsize=8, loc="center left")
+    save_fig(fig, os.path.join(plots, "vocablens_top1_group.png"))
+
+    # ---- 3. per-token preference, which corrects for 256 bins vs ~31.7k words ----
+    ratio = np.log10(np.maximum(pb, 1e-30) / size["bins"]) - \
+        np.log10(np.maximum(pt, 1e-30) / size["text"])
+    lo, md, hi = np.percentile(ratio, [25, 50, 75], axis=0)
+    fig, ax = new_axes("Average bin vs average word (corrects for group size)",
+                       "log10( P(bins)/256  ÷  P(text)/#text )")
+    ax.plot(layers, md, color=INK, linewidth=2)
+    ax.fill_between(layers, lo, hi, color=INK, alpha=0.15, linewidth=0)
+    ax.axhline(0, color=MUTED, linewidth=0.8)
+    ax.text(0.3, 0.1, "above 0: an average bin beats an average word", color=MUTED, fontsize=8)
+    ax.set_xlim(0, L)
+    save_fig(fig, os.path.join(plots, "vocablens_per_token.png"))
+
+    # ---- 4. heatmap: median P(bins) by layer x episode progress ----
+    prog = np.minimum((r["step"] / r["ep_len"] * 10).astype(int), 9)
+    heat = np.array([np.median(pb[prog == k], axis=0) if (prog == k).any()
+                     else np.full(n_lay, np.nan) for k in range(10)])
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    im = ax.imshow(heat, aspect="auto", origin="lower", cmap="viridis", vmin=0, vmax=1,
+                   extent=(-0.5, L + 0.5, 0, 100))
+    fig.colorbar(im, ax=ax, label="median P(bins)")
+    ax.set_title("P(bins) by layer and by how far into the episode", loc="left",
+                 fontsize=12, color=INK)
+    ax.set_xlabel("layer", color=MUTED)
+    ax.set_ylabel("episode progress (% of steps, deciles)", color=MUTED)
+    save_fig(fig, os.path.join(plots, "vocablens_heatmap_progress.png"))
+
+    # ---- 5. settle layer vs episode progress, success vs fail ----
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    succ = r["success"]
+    for val, lab, color in [(1, "success", "#1baf7a"), (0, "fail", "#eb6834"),
+                            (-1, "unknown", MUTED)]:
+        sel = succ == val
+        if not sel.any():
+            continue
+        x, y, ylo, yhi = [], [], [], []
+        for k in range(10):
+            v = settle[sel & (prog == k)]
+            v = v[np.isfinite(v)]
+            if len(v):
+                x.append(k * 10 + 5)
+                a, b, c = np.percentile(v, [25, 50, 75])
+                ylo.append(a); y.append(b); yhi.append(c)
+        ax.plot(x, y, color=color, linewidth=2, marker="o",
+                label=f"{lab} ({len(np.unique(r['episode'][sel]))} episodes)")
+        ax.fill_between(x, ylo, yhi, color=color, alpha=0.15, linewidth=0)
+    ax.set_title("Layer from which P(bins) stays above 0.5", loc="left", fontsize=12, color=INK)
+    ax.set_xlabel("episode progress (% of steps)", color=MUTED)
+    ax.set_ylabel("settle layer (median, IQR band)", color=MUTED)
+    ax.set_ylim(0, L)
+    ax.grid(True, color=GRID, linewidth=0.6)
+    ax.legend(frameon=False, fontsize=8)
+    save_fig(fig, os.path.join(plots, "vocablens_settle_progress.png"))
+
+    # ---- CSVs ----
+    cols = {"p_bins_median": q50, "p_bins_q25": q25, "p_bins_q75": q75}
+    for g in VL_GROUPS:
+        cols[f"p_{g}_mean"] = mass[..., gi[g]].mean(0)
+    cols["p_text_median"] = np.median(pt, 0)
+    for g in VL_GROUPS:
+        cols[f"top1_{g}_frac"] = frac[g]
+    cols["log10_per_token_ratio_median"] = md
+    cols["bins_argmax_eq_final"] = (r["bin_argmax"] == r["final"][:, None]).mean(0)
+    cols["logp_generated_median"] = np.median(r["logp_gen"], 0)
+    cols["entropy_median"] = np.median(r["entropy"], 0)
+    write_layer_csv(os.path.join(plots, "vocablens_by_layer.csv"), cols)
+
+    path = os.path.join(plots, "vocablens_top_words.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["layer", "rank", "token", "token_id",
+                    "frac_steps_top_text_token", "frac_steps_top1_overall"])
+        for l in range(n_lay):
+            ids, cnt = np.unique(r["text_ids"][:, l, 0], return_counts=True)
+            for k, j in enumerate(np.argsort(-cnt)[:10]):
+                t = int(ids[j])
+                w.writerow([l, k + 1, str(tokens[t]), t, f"{cnt[j] / n:.4f}",
+                            f"{(r['top1'][:, l] == t).mean():.4f}"])
+    print(f"[csv]  {path}")
+
+    path = os.path.join(plots, "vocablens_summary.csv")
+    norms = dict(zip(VL_GROUPS, r["group_row_norm"]))
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["quantity", "value", "definition"])
+        w.writerow(["crossover_layer", "" if cross is None else cross,
+                    "first layer whose median P(bins) over steps is >= 0.5"])
+        w.writerow(["settle_layer_median", f"{np.nanmedian(settle):.1f}",
+                    "median over steps of the first layer from which P(bins) stays > 0.5"])
+        w.writerow(["never_settled_frac", f"{np.isnan(settle).mean():.4f}",
+                    "steps whose final-layer P(bins) is <= 0.5"])
+        w.writerow(["bins_chance_share", f"{size['bins'] / sum(size.values()):.4g}",
+                    "P(bins) if every token were equally likely"])
+        for g in VL_GROUPS:
+            w.writerow([f"row_norm_{g}", f"{norms[g]:.4f}",
+                        f"mean L2 norm of the lm_head rows of {g} tokens"])
+        w.writerow(["n_steps", n, f"steps from {str(r['src_dir'])}"])
+    print(f"[csv]  {path}  crossover={cross} settle median={np.nanmedian(settle):.1f}")
+    print(f"[info] lm_head row norms: " + ", ".join(f"{g} {norms[g]:.3f}" for g in VL_GROUPS))
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens", "tunedlens"],
+    p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens", "tunedlens",
+                                      "vocablens"],
                    required=True)
     p.add_argument("--suite", default="libero_spatial", choices=list(MAX_STEPS))
     p.add_argument("--tasks", default="0-9", help='task ids, e.g. "0-9" or "0,3,5"')
@@ -1608,11 +1982,11 @@ def main():
                    help="this run's folder, e.g. runs/run1")
     p.add_argument("--save_video", action="store_true")
     p.add_argument("--src_dir", default=None,
-                   help="--mode probe/tunedlens: read hidden/ (and lens/) from this run's "
+                   help="--mode probe/tunedlens/vocablens: read hidden/ (and lens/) from this run's "
                         "folder instead of --out_dir, e.g. runs/run2")
     p.add_argument("--analyze", action="store_true",
                    help="with --mode lens: plot saved lens data, no model load; with "
-                        "--mode tunedlens: replot saved translator results")
+                        "--mode tunedlens/vocablens: replot saved results")
     p.add_argument("--dry_run", action="store_true",
                    help="1 task, 1 init, 20 steps")
     p.add_argument("--model_id", default=None,
@@ -1647,6 +2021,8 @@ def main():
         run_probes(args)
     elif args.mode == "tunedlens":
         plot_tunedlens(args.out_dir) if args.analyze else run_tunedlens(args)
+    elif args.mode == "vocablens":
+        plot_vocablens(args.out_dir) if args.analyze else run_vocablens(args)
     elif args.mode == "lens" and args.analyze:
         analyze_lens(args)
     else:
