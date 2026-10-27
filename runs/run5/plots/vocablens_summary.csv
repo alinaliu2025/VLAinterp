@@ -1,0 +1,13 @@
+quantity,value,definition
+settle_layer_median,21,median over steps of the first layer from which P(bins) stays > 0.5 (headline: where bins take over for good)
+dip_layer,16,layer >= 1 where the median P(bins) is lowest
+dip_p_bins_median,0.4299,median P(bins) at dip_layer
+right_bin_half_layer,31,first layer where the bins-only argmax equals the generated bucket on >= 50% of steps
+first_layer_bins_ge_half,1,"first layer whose median P(bins) is >= 0.5; misleading when P(bins) dips and recovers, use settle_layer_median"
+never_settled_frac,0.0000,steps whose final-layer P(bins) is <= 0.5
+bins_chance_share,0.007984,P(bins) if every token were equally likely
+row_norm_bins,1.6989,mean L2 norm of the lm_head rows of bins tokens
+row_norm_text,1.3795,mean L2 norm of the lm_head rows of text tokens
+row_norm_pad,1.4753,mean L2 norm of the lm_head rows of pad tokens
+row_norm_special,1.4458,mean L2 norm of the lm_head rows of special tokens
+n_steps,6460,steps from runs/run2
