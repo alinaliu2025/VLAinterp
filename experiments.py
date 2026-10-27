@@ -1815,12 +1815,19 @@ def plot_vocablens(out_dir):
     pb, pt = mass[..., gi["bins"]], mass[..., gi["text"]]
     q25, q50, q75 = np.percentile(pb, [25, 50, 75], axis=0)
 
-    # Crossover: first layer whose MEDIAN P(bins) passes 0.5. Per step, the
-    # settle layer is the first layer from which P(bins) stays above 0.5.
-    cross = onset(q50, layers, 0.5)
+    # Per step, the settle layer is the first layer from which P(bins) STAYS
+    # above 0.5; its median is the headline number. The first layer where the
+    # median P(bins) passes 0.5 is kept only for reference: run5 showed P(bins)
+    # can be ~1 at layer 1, dip in the middle layers and recover, so it can
+    # land at layer 1 and miss where bins actually take over.
+    first_half = onset(q50, layers, 0.5)
     below = pb <= 0.5
     settle = np.where(below.any(1), n_lay - below[:, ::-1].argmax(1), 0).astype(float)
     settle[below[:, L]] = np.nan                       # never settles (final layer below 0.5)
+    settle_med = None if np.isnan(settle).all() else int(round(np.nanmedian(settle)))
+    dip = int(np.argmin(q50[1:])) + 1                  # skip layer 0 (the "▁" embedding)
+    right_bin = (r["bin_argmax"] == r["final"][:, None]).mean(0)
+    half_right = onset(right_bin, layers, 0.5)
 
     # ---- 1. probability mass by group (linear and log) ----
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
@@ -1840,10 +1847,10 @@ def plot_vocablens(out_dir):
         else:
             ax.set_ylim(0, 1.02)
             ax.axhline(0.5, color=MUTED, linewidth=0.8)
-        if cross is not None:
-            ax.axvline(cross, color=INK, linestyle=":", linewidth=1.2)
-            ax.text(cross + 0.3, 0.97, f"crossover\nlayer {cross}", fontsize=8, va="top",
-                    transform=ax.get_xaxis_transform())
+        if settle_med is not None:
+            ax.axvline(settle_med, color=INK, linestyle=":", linewidth=1.2)
+            ax.text(settle_med + 0.3, 0.97, f"bins stay > 0.5\nfrom layer {settle_med}\n(median)",
+                    fontsize=8, va="top", transform=ax.get_xaxis_transform())
         ax.set_title(f"Probability mass by token group ({'log' if log else 'linear'} scale)",
                      loc="left", fontsize=12, color=INK)
         ax.set_xlabel("layer (0 = embeddings, last = final post-norm)", color=MUTED)
@@ -1951,10 +1958,18 @@ def plot_vocablens(out_dir):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["quantity", "value", "definition"])
-        w.writerow(["crossover_layer", "" if cross is None else cross,
-                    "first layer whose median P(bins) over steps is >= 0.5"])
-        w.writerow(["settle_layer_median", f"{np.nanmedian(settle):.1f}",
-                    "median over steps of the first layer from which P(bins) stays > 0.5"])
+        w.writerow(["settle_layer_median", "" if settle_med is None else settle_med,
+                    "median over steps of the first layer from which P(bins) stays > 0.5 "
+                    "(headline: where bins take over for good)"])
+        w.writerow(["dip_layer", dip,
+                    "layer >= 1 where the median P(bins) is lowest"])
+        w.writerow(["dip_p_bins_median", f"{q50[dip]:.4f}", "median P(bins) at dip_layer"])
+        w.writerow(["right_bin_half_layer", "" if half_right is None else half_right,
+                    "first layer where the bins-only argmax equals the generated bucket "
+                    "on >= 50% of steps"])
+        w.writerow(["first_layer_bins_ge_half", "" if first_half is None else first_half,
+                    "first layer whose median P(bins) is >= 0.5; misleading when P(bins) "
+                    "dips and recovers, use settle_layer_median"])
         w.writerow(["never_settled_frac", f"{np.isnan(settle).mean():.4f}",
                     "steps whose final-layer P(bins) is <= 0.5"])
         w.writerow(["bins_chance_share", f"{size['bins'] / sum(size.values()):.4g}",
@@ -1963,7 +1978,8 @@ def plot_vocablens(out_dir):
             w.writerow([f"row_norm_{g}", f"{norms[g]:.4f}",
                         f"mean L2 norm of the lm_head rows of {g} tokens"])
         w.writerow(["n_steps", n, f"steps from {str(r['src_dir'])}"])
-    print(f"[csv]  {path}  crossover={cross} settle median={np.nanmedian(settle):.1f}")
+    print(f"[csv]  {path}  settle median={settle_med} dip=layer {dip} "
+          f"(P(bins) {q50[dip]:.2f}) right bin on half the steps from layer {half_right}")
     print(f"[info] lm_head row norms: " + ", ".join(f"{g} {norms[g]:.3f}" for g in VL_GROUPS))
 
 
