@@ -1854,13 +1854,26 @@ def plot_vocablens(out_dir):
         ax.set_title(f"Probability mass by token group ({'log' if log else 'linear'} scale)",
                      loc="left", fontsize=12, color=INK)
         ax.set_xlabel("layer (0 = embeddings, last = final post-norm)", color=MUTED)
-        ax.set_ylabel("share of full-vocab probability (median, IQR band)", color=MUTED)
+        ax.set_ylabel(r"$P_g(\ell) = \sum_{i \in g}\ p_i(\ell)$" + "\nline: median over steps, band: 25th–75th pct",
+                      color=MUTED)
         ax.grid(True, color=GRID, linewidth=0.6)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
         ax.set_xlim(0, L)
     axes[0].legend(frameon=False, fontsize=8, loc="center left")
-    save_fig(fig, os.path.join(plots, "vocablens_mass.png"))
+    # save_fig's tight_layout would ignore the footnote, so leave room for it here.
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    fig.text(0.01, 0.015,
+             r"$p_i(\ell) = \mathrm{softmax}\left(W_U\ \mathrm{RMSNorm}(h_\ell)\right)_i$"
+             f"  over all {sum(size.values()):,} tokens;  "
+             r"$h_\ell$ = hidden state at layer $\ell$ at the position that produces x;  "
+             r"$g$ = bins / text / pad / special;  "
+             r"$P_{\mathrm{bins}} + P_{\mathrm{text}} + P_{\mathrm{pad}} + P_{\mathrm{special}} = 1$",
+             fontsize=9, color=MUTED)
+    path = os.path.join(plots, "vocablens_mass.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] {path}")
 
     # ---- 2. what group is the single most likely token in? ----
     tg = r["top1_group"]
