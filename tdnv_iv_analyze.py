@@ -334,7 +334,7 @@ def main():
         lines += [f"## Instruction set `{name}`", ""]
         lines += [f"{i}. {s}" for i, s in enumerate(instructions)] + [""]
         lines += ["| features | Exp 1 (by image) min | Exp 2 (by instruction) min | "
-                  "Exp 1 / Exp 2 at last readout | curves cross | shuffled / real (min over layers) |",
+                  "Exp 1 / Exp 2 at last readout | curves cross | shuffled / real at each minimum |",
                   "|---|---|---|---|---|---|"]
         for feat, s in summary.items():
             cross = (f"between layers {s['crossing'][0]} and {s['crossing'][1]}"
