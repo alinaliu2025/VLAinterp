@@ -1,0 +1,39 @@
+{
+  "_doc": "run5: TDNV image vs. instruction (spec: tdnv_image_vs_instruction.md). One crossed grid per instruction set: every instruction x every image. Exp 1 groups the grid by image, Exp 2 by instruction, so both use the same hidden states and the same k and N.",
+  "model_id": "openvla/openvla-7b-finetuned-libero-spatial",
+  "suite": "libero_spatial",
+  "layout_tasks": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "inits": [0, 1, 2, 3, 4],
+  "k": 10,
+  "N": 10,
+  "variation": "different tasks",
+  "seed": 7,
+  "n_shuffles": 200,
+  "scatter_layers": [1, 4, 7, 12, 16, 24, 31, 32],
+  "instruction_sets": {
+    "suite": [
+      "pick up the black bowl between the plate and the ramekin and place it on the plate",
+      "pick up the black bowl next to the ramekin and place it on the plate",
+      "pick up the black bowl from table center and place it on the plate",
+      "pick up the black bowl on the cookie box and place it on the plate",
+      "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
+      "pick up the black bowl on the ramekin and place it on the plate",
+      "pick up the black bowl next to the cookie box and place it on the plate",
+      "pick up the black bowl on the stove and place it on the plate",
+      "pick up the black bowl next to the plate and place it on the plate",
+      "pick up the black bowl on the wooden cabinet and place it on the plate"
+    ],
+    "generic": [
+      "pick up the black bowl and place it on the plate",
+      "stack the two black bowls",
+      "turn on the stove",
+      "open the middle drawer of the wooden cabinet",
+      "open the bottom drawer of the wooden cabinet",
+      "open the bottom drawer and put the black bowl inside",
+      "push the plate to the front of the stove",
+      "move the plate next to the cookie box",
+      "push the cookie box to the front of the stove",
+      "pick up the plate and place it next to the ramekin"
+    ]
+  }
+}
