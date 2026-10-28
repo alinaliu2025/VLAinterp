@@ -318,10 +318,18 @@ def main():
             continue
         D = np.load(path)
         if name == list(cfg["instruction_sets"])[0]:
+            # every image exactly as the model saw it: one PNG each + a sheet per init
+            import matplotlib.pyplot as plt
             src = D["image_src"]
-            sel = [i for i in range(len(src)) if src[i, 1] == cfg["inits"][0]]
-            contact_sheet(D["images"][sel], [f"layout {src[i, 0]} (init {src[i, 1]})" for i in sel],
-                          os.path.join(plots, "images_init0.png"))
+            img_dir = os.path.join(plots, "images")
+            os.makedirs(img_dir, exist_ok=True)
+            for i, (t, init) in enumerate(src):
+                plt.imsave(os.path.join(img_dir, f"layout{t}_init{init}.png"), D["images"][i])
+            print(f"[img]  {len(src)} images in {img_dir}")
+            for init in cfg["inits"]:
+                sel = [i for i in range(len(src)) if src[i, 1] == init]
+                contact_sheet(D["images"][sel], [f"layout {src[i, 0]} (init {init})" for i in sel],
+                              os.path.join(plots, f"images_init{init}.png"))
         summary, instructions = analyze_set(name, D, cfg, plots, rng)
         lines += [f"## Instruction set `{name}`", ""]
         lines += [f"{i}. {s}" for i, s in enumerate(instructions)] + [""]
