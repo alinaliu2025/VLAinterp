@@ -1,0 +1,9 @@
+label,n_failures,meaning
+wrong_bowl,0,lifted the look-alike bowl
+never_closed,0,never commanded the gripper to close
+closed_away,3,first close was > 0.12 m from the target bowl; it never lifted
+stuck_holding,1,"closed on the bowl, never lifted it, arm stopped moving"
+missed_grasp,2,"closed next to the target bowl, but it never lifted"
+dropped,0,"lifted the bowl, which ended > 0.10 m from the plate"
+released_near_plate,2,carried the bowl to the plate and let go; the task did not count it
+never_released,0,"carried the bowl to the plate, still holding it at the time limit"

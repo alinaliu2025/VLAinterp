@@ -17,6 +17,8 @@ Batch experiments on OpenVLA + LIBERO, built on top of singleVLA.py.
                             how much probability goes to words vs action bins at each
                             layer (GPU, no rollouts); --src_dir as for tunedlens
     --mode vocablens --analyze   replot saved vocab-lens results (CPU)
+    --mode failures         label what went wrong in each failed episode from the
+                            saved simulator state (CPU, no model); --src_dir as above
 
 Modes say WHAT the script does. Runs are numbered jobs (run0, run1, ...), each
 with its own folder runs/runN/ passed as --out_dir; see runs/RUNS.md.
@@ -47,7 +49,7 @@ Output layout (out_dir is required, e.g. runs/run1):
     hidden/task{t}_init{i}.npz            --mode lens
     patchlens/task{t}_init{i}.npz         --mode patchlens
     patch_hidden/task{t}_init{i}.npz      --mode patchlens (every PATCH_HIDDEN_EVERY steps)
-    plots/                                --analyze, --mode probe, --mode tunedlens
+    plots/                                --analyze, --mode probe, --mode tunedlens, --mode failures
     tunedlens/readout.npz                 --mode tunedlens: cached lm_head action rows + final norm
     tunedlens/results.npz                 --mode tunedlens: metrics, out-of-fold argmax
     vocablens/readout.npz                 --mode vocablens: cached full lm_head + final norm + token strings
@@ -1940,6 +1942,74 @@ def plot_vocablens(out_dir):
     ax.legend(frameon=False, fontsize=8)
     save_fig(fig, os.path.join(plots, "vocablens_settle_progress.png"))
 
+    # ---- 6. entropy and confidence, and how entropy tracks P(text) ----
+    ent = r["entropy"]
+    # Top-1 probability over the full vocab: the better of the top bin (bin_pmax
+    # is renormalised over bins, so scale it back by P(bins)) and the top text
+    # token. Ignores pad/special, which are top-1 on well under 1% of steps.
+    conf = np.maximum(r["bin_pmax"] * pb, np.exp(r["text_logp"][..., 0]))
+
+    def rank_corr(a, b):
+        if np.ptp(a) == 0 or np.ptp(b) == 0:             # e.g. layer 0: same at every step
+            return np.nan
+        ra, rb = a.argsort().argsort(), b.argsort().argsort()
+        return float(np.corrcoef(ra, rb)[0, 1])
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    ax = axes[0]
+    lo, md, hi = np.percentile(ent, [25, 50, 75], axis=0)
+    ax.plot(layers, md, color=INK, linewidth=2)
+    ax.fill_between(layers, lo, hi, color=INK, alpha=0.15, linewidth=0)
+    ax.set_title("Uncertainty: entropy of the full-vocab prediction", loc="left",
+                 fontsize=12, color=INK)
+    ax.set_ylabel(r"$H(\ell) = -\sum_i p_i \ln p_i$  (nats)" + "\nline: median, band: 25th–75th pct",
+                  color=MUTED)
+    ax.set_ylim(0, np.log(sum(size.values())))
+    sec = ax.secondary_yaxis("right", functions=(np.exp, lambda y: np.log(np.maximum(y, 1e-12))))
+    sec.set_ylabel(r"$e^H$ = effective number of tokens", color=MUTED)
+    sec.set_yticks([1, 10, 100, 1000, 10000])
+    sec.set_yticklabels(["1", "10", "100", "1k", "10k"])
+
+    ax = axes[1]
+    lo, md, hi = np.percentile(conf, [25, 50, 75], axis=0)
+    ax.plot(layers, md, color=INK, linewidth=2, label="top-1 token, any group")
+    ax.fill_between(layers, lo, hi, color=INK, alpha=0.15, linewidth=0)
+    ax.plot(layers, q50, color=VL_COLORS["bins"], linewidth=1.4, linestyle="--",
+            label="P(bins), for comparison")
+    ax.set_title("Confidence: probability of the single top token", loc="left",
+                 fontsize=12, color=INK)
+    ax.set_ylabel(r"$\max_i\ p_i(\ell)$" + "\nline: median, band: 25th–75th pct", color=MUTED)
+    ax.set_ylim(0, 1.02)
+    ax.legend(frameon=False, fontsize=8, loc="center left")
+
+    ax = axes[2]
+    edges = np.linspace(0, 1, 11)
+    for l, color in zip([12, 16, 20], DIM_COLORS):
+        if l > L:
+            continue
+        x, y = [], []
+        for a, b in zip(edges[:-1], edges[1:]):
+            sel = (pt[:, l] >= a) & (pt[:, l] < b if b < 1 else pt[:, l] <= b)
+            if sel.sum() >= 20:
+                x.append((a + b) / 2)
+                y.append(np.median(ent[sel, l]))
+        ax.plot(x, y, color=color, linewidth=2, marker="o",
+                label=f"layer {l} (rank corr {rank_corr(pt[:, l], ent[:, l]):.2f})")
+    ax.set_title("Steps with more P(text) are less certain", loc="left", fontsize=12, color=INK)
+    ax.set_xlabel(r"$P_{\mathrm{text}}$ at that step and layer (bins of 0.1, $\geq$20 steps each)",
+                  color=MUTED)
+    ax.set_ylabel("median entropy H (nats)", color=MUTED)
+    ax.legend(frameon=False, fontsize=8)
+    for ax in axes:
+        if ax is not axes[2]:
+            ax.set_xlabel("layer (0 = embeddings, last = final post-norm)", color=MUTED)
+            ax.set_xlim(0, L)
+        ax.grid(True, color=GRID, linewidth=0.6)
+        ax.spines["top"].set_visible(False)
+    axes[1].spines["right"].set_visible(False)
+    axes[2].spines["right"].set_visible(False)
+    save_fig(fig, os.path.join(plots, "vocablens_entropy.png"))
+
     # ---- CSVs ----
     cols = {"p_bins_median": q50, "p_bins_q25": q25, "p_bins_q75": q75}
     for g in VL_GROUPS:
@@ -1950,7 +2020,10 @@ def plot_vocablens(out_dir):
     cols["log10_per_token_ratio_median"] = md
     cols["bins_argmax_eq_final"] = (r["bin_argmax"] == r["final"][:, None]).mean(0)
     cols["logp_generated_median"] = np.median(r["logp_gen"], 0)
-    cols["entropy_median"] = np.median(r["entropy"], 0)
+    cols["entropy_median"] = np.median(ent, 0)
+    cols["top1_prob_median"] = np.median(conf, 0)
+    cols["rank_corr_p_text_entropy"] = np.array([rank_corr(pt[:, l], ent[:, l])
+                                                 for l in range(n_lay)])
     write_layer_csv(os.path.join(plots, "vocablens_by_layer.csv"), cols)
 
     path = os.path.join(plots, "vocablens_top_words.csv")
@@ -1997,12 +2070,241 @@ def plot_vocablens(out_dir):
 
 
 # ---------------------------------------------------------------------------
+# --mode failures: what went wrong in each failed episode (CPU, no model)
+# ---------------------------------------------------------------------------
+
+# Every libero_spatial instruction is "pick up the black bowl <where> and place
+# it on the plate". bowl_1 is always the bowl to move (run_failures checks this:
+# it is lifted in every successful episode) and bowl_2 is the look-alike.
+FAIL_TARGET = "obj_akita_black_bowl_1_pos"
+FAIL_DISTRACTOR = "obj_akita_black_bowl_2_pos"
+FAIL_PLATE = "obj_plate_1_pos"
+# Thresholds in meters, read off run2. "gap" is the distance between the two
+# fingers: ~0.078 open, 0.004-0.024 closed on a bowl rim, ~0.001 closed on nothing.
+FAIL_NEAR = 0.12          # gripper-to-bowl distance at the first close; successes: 0.04-0.10
+FAIL_LIFT = 0.03          # the bowl counts as lifted once 3 cm above where it started
+FAIL_ON_PLATE = 0.10      # bowl center within 10 cm of the plate center (xy)
+FAIL_OPEN_GAP = 0.06      # gap above this = fingers open
+FAIL_STILL = 0.02         # "not moving": gripper stays within 2 cm ...
+FAIL_STILL_STEPS = 50     # ... over the last 50 steps
+# Checked in this order; the first that fits is the label.
+FAIL_LABELS = {
+    "wrong_bowl": "lifted the look-alike bowl",
+    "never_closed": "never commanded the gripper to close",
+    "closed_away": f"first close was > {FAIL_NEAR:.2f} m from the target bowl; it never lifted",
+    "stuck_holding": "closed on the bowl, never lifted it, arm stopped moving",
+    "missed_grasp": "closed next to the target bowl, but it never lifted",
+    "dropped": f"lifted the bowl, which ended > {FAIL_ON_PLATE:.2f} m from the plate",
+    "released_near_plate": "carried the bowl to the plate and let go; the task did not count it",
+    "never_released": "carried the bowl to the plate, still holding it at the time limit",
+}
+FAIL_COLORS = dict(zip(FAIL_LABELS, ["#4a3aa7", "#898781", "#b23a0e", "#eda100",
+                                     "#eb6834", "#e87ba4", "#2a78d6", "#1baf7a"]))
+
+
+def failure_features(d):
+    """Per-episode numbers from the simulator state saved in hidden/*.npz."""
+    eef = d["eef_pos"]
+    gap = d["gripper_qpos"][:, 0] - d["gripper_qpos"][:, 1]
+    grip = d["action"][:, 6]                        # executed: +1 close, -1 open
+    tgt, plate = d[FAIL_TARGET], d[FAIL_PLATE]
+    objs = {k[len("obj_"):-len("_pos")]: d[k] for k in d.files if k.startswith("obj_")}
+    T = len(eef)
+    closes = np.flatnonzero((grip > 0) & np.r_[True, grip[:-1] <= 0])
+    moved = np.linalg.norm(eef - eef[0], axis=1) > FAIL_STILL
+    lift = tgt[:, 2] - tgt[0, 2]
+    tail = eef[-FAIL_STILL_STEPS:]
+    f = {
+        "num_steps": T,
+        "idle_steps": int(moved.argmax()) if moved.any() else T,
+        "n_close": len(closes),
+        "max_lift": float(lift.max()),
+        "lift_step": int((lift > FAIL_LIFT).argmax()) if (lift > FAIL_LIFT).any() else -1,
+        "distractor_lift": float((d[FAIL_DISTRACTOR][:, 2] - d[FAIL_DISTRACTOR][0, 2]).max()),
+        "final_xy_to_plate": float(np.linalg.norm(tgt[-1, :2] - plate[-1, :2])),
+        "final_z_above_plate": float(tgt[-1, 2] - plate[-1, 2]),
+        "final_gap": float(gap[-1]),
+        "still_at_end": int(T > FAIL_STILL_STEPS
+                            and np.linalg.norm(tail - tail[-1], axis=1).max() < FAIL_STILL),
+        "first_close_step": -1, "close_dist": np.nan, "close_dxy": np.nan,
+        "close_dz": np.nan, "close_nearest": "", "close_nearest_dist": np.nan,
+    }
+    if len(closes):
+        t = closes[0]
+        off = eef[t] - tgt[t]
+        dist = {k: float(np.linalg.norm(eef[t] - v[t])) for k, v in objs.items()}
+        near = min(dist, key=dist.get)
+        f.update(first_close_step=int(t), close_dist=float(np.linalg.norm(off)),
+                 close_dxy=float(np.linalg.norm(off[:2])), close_dz=float(off[2]),
+                 close_nearest=near, close_nearest_dist=dist[near])
+    return f
+
+
+def failure_label(f, success):
+    if success:
+        return "success"
+    if f["distractor_lift"] > FAIL_LIFT:
+        return "wrong_bowl"
+    if f["n_close"] == 0:
+        return "never_closed"
+    if f["max_lift"] < FAIL_LIFT:
+        if f["close_dist"] > FAIL_NEAR:
+            return "closed_away"
+        if f["still_at_end"] and f["final_gap"] < FAIL_OPEN_GAP:
+            return "stuck_holding"
+        return "missed_grasp"
+    if f["final_xy_to_plate"] > FAIL_ON_PLATE:
+        return "dropped"
+    return "released_near_plate" if f["final_gap"] > FAIL_OPEN_GAP else "never_released"
+
+
+def run_failures(args):
+    """
+    Label every failed episode of a --mode lens run (--src_dir) with what went
+    wrong, from the saved simulator state only: gripper and object positions,
+    finger gap and the executed gripper command. Says WHAT happened (e.g. the
+    gripper closed 15 cm from the bowl), not WHY; the hidden states are not read.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    src = args.src_dir or args.out_dir
+    plots = os.path.join(args.out_dir, "plots")
+    os.makedirs(plots, exist_ok=True)
+    episodes = read_episodes_csv(os.path.join(src, "episodes.csv"))
+    if not episodes:
+        sys.exit(f"[error] no episodes.csv in {src}")
+
+    rows, traces = [], {}
+    for (t, i), ep in sorted(episodes.items()):
+        path = os.path.join(src, "hidden", episode_stem(t, i) + ".npz")
+        if not os.path.isfile(path):
+            sys.exit(f"[error] {path} missing; failures needs a --mode lens run")
+        d = np.load(path)                  # lazy: the hidden states are never read
+        success = int(ep["success"])
+        f = failure_features(d)
+        if f["num_steps"] != int(ep["num_steps"]):
+            raise SanityCheckError(f"{path}: {f['num_steps']} saved steps, "
+                                   f"episodes.csv says {ep['num_steps']}")
+        if success and f["max_lift"] < FAIL_LIFT:
+            raise SanityCheckError(f"task {t} init {i} succeeded without lifting {FAIL_TARGET}: "
+                                   f"the target-bowl assumption is wrong for this task")
+        rows.append({"task_id": t, "init_idx": i, "success": success,
+                     "label": failure_label(f, success), **f,
+                     "instruction": ep["instruction"]})
+        traces[(t, i)] = {
+            "dist": np.linalg.norm(d["eef_pos"] - d[FAIL_TARGET], axis=1),
+            "lift": d[FAIL_TARGET][:, 2] - d[FAIL_TARGET][0, 2],
+            "gap": d["gripper_qpos"][:, 0] - d["gripper_qpos"][:, 1],
+            "close": d["action"][:, 6] > 0}
+
+    out_csv = os.path.join(plots, "failures_episodes.csv")
+    with open(out_csv, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in r.items()})
+    print(f"[csv]  {out_csv}")
+    fails = [r for r in rows if not r["success"]]
+    counts = {lab: sum(r["label"] == lab for r in fails) for lab in FAIL_LABELS}
+    out_csv = os.path.join(plots, "failures_summary.csv")
+    with open(out_csv, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["label", "n_failures", "meaning"])
+        for lab, n in counts.items():
+            w.writerow([lab, n, FAIL_LABELS[lab]])
+    print(f"[csv]  {out_csv}")
+
+    # 1. One timeline per failed episode, with a success of the same task dashed.
+    if fails:
+        ncol = min(4, len(fails))
+        nrow = -(-len(fails) // ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.4 * nrow),
+                                 squeeze=False, sharey=True)
+        for ax, r in zip(axes.flat, fails):
+            tr = traces[(r["task_id"], r["init_idx"])]
+            steps = np.arange(len(tr["dist"]))
+            ref = next((traces[(r["task_id"], s["init_idx"])] for s in rows
+                        if s["task_id"] == r["task_id"] and s["success"]), None)
+            if ref is not None:
+                ax.plot(ref["dist"], color="#2a78d6", lw=1, ls="--", alpha=0.5,
+                        label="gripper to bowl, a success")
+            ax.fill_between(steps, 0, 0.5, where=tr["close"], color=GRID, step="mid",
+                            label="close commanded")
+            ax.plot(tr["dist"], color="#2a78d6", lw=1.6, label="gripper to bowl")
+            ax.plot(tr["lift"], color="#eb6834", lw=1.6, label="bowl height gained")
+            ax.plot(tr["gap"], color=INK, lw=1, label="finger gap")
+            ax.set_title(f"task {r['task_id']} init {r['init_idx']}: {r['label']}",
+                         loc="left", fontsize=10, color=FAIL_COLORS[r["label"]])
+            ax.set_ylim(0, 0.5)
+            ax.grid(True, color=GRID, linewidth=0.6)
+            for s in ("top", "right"):
+                ax.spines[s].set_visible(False)
+            ax.tick_params(colors=MUTED, labelsize=8)
+        for ax in axes.flat[len(fails):]:
+            ax.axis("off")
+        for ax in axes[:, 0]:
+            ax.set_ylabel("meters", color=MUTED)
+        for ax in axes[-1]:
+            ax.set_xlabel("env step", color=MUTED)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False,
+                   fontsize=9)
+        fig.suptitle("Failed episodes: distance gripper→target bowl, bowl lift, finger gap",
+                     x=0.01, ha="left", fontsize=12, color=INK)
+        fig.tight_layout(rect=(0, 0.06, 1, 0.96))
+        path = os.path.join(plots, "failures_timelines.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[plot] {path}")
+
+    # 2. Where the gripper was, relative to the target bowl, at the first close.
+    fig, ax = plt.subplots(figsize=(10, 4.6))
+    ok = [r for r in rows if r["success"] and r["first_close_step"] >= 0]
+    ax.scatter([r["close_dxy"] for r in ok], [r["close_dz"] for r in ok], s=22,
+               color=MUTED, alpha=0.6, label=f"success ({len(ok)})")
+    for r in fails:
+        if r["first_close_step"] < 0:
+            continue
+        ax.scatter(r["close_dxy"], r["close_dz"], s=60, color=FAIL_COLORS[r["label"]],
+                   edgecolor=INK, linewidth=0.5, zorder=3)
+        ax.annotate(f"t{r['task_id']}/i{r['init_idx']} {r['label']}",
+                    (r["close_dxy"], r["close_dz"]), xytext=(5, 4),
+                    textcoords="offset points", fontsize=8, color=FAIL_COLORS[r["label"]])
+    a = np.linspace(0, np.pi / 2, 100)
+    ax.plot(FAIL_NEAR * np.cos(a), FAIL_NEAR * np.sin(a), color=MUTED, ls=":", lw=1)
+    ax.text(FAIL_NEAR * 0.72, FAIL_NEAR * 0.72, f"{FAIL_NEAR:.2f} m", fontsize=8,
+            color=MUTED)
+    ax.set_xlabel("horizontal distance gripper→target bowl (m)", color=MUTED)
+    ax.set_ylabel("gripper height above bowl (m)", color=MUTED)
+    ax.set_title("Gripper position at the first close command", loc="left",
+                 fontsize=12, color=INK)
+    ax.set_xlim(0, None)
+    ax.set_ylim(0, None)
+    ax.set_aspect("equal")
+    ax.grid(True, color=GRID, linewidth=0.6)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+    save_fig(fig, os.path.join(plots, "failures_grasp.png"))
+
+    print(f"[info] {len(fails)} failed of {len(rows)} episodes")
+    for r in fails:
+        print(f"[info]   task {r['task_id']} init {r['init_idx']}: {r['label']:<20s} "
+              f"first close step {r['first_close_step']}, {r['close_dist']:.3f} m from the bowl "
+              f"(nearest: {r['close_nearest']}), {r['n_close']} close commands, "
+              f"bowl lift {r['max_lift']:.3f} m, idle {r['idle_steps']} steps")
+    print("[info] counts: " + ", ".join(f"{k} {n}" for k, n in counts.items() if n))
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens", "tunedlens",
-                                      "vocablens"],
+                                      "vocablens", "failures"],
                    required=True)
     p.add_argument("--suite", default="libero_spatial", choices=list(MAX_STEPS))
     p.add_argument("--tasks", default="0-9", help='task ids, e.g. "0-9" or "0,3,5"')
@@ -2011,7 +2313,7 @@ def main():
                    help="this run's folder, e.g. runs/run1")
     p.add_argument("--save_video", action="store_true")
     p.add_argument("--src_dir", default=None,
-                   help="--mode probe/tunedlens/vocablens: read hidden/ (and lens/) from this run's "
+                   help="--mode probe/tunedlens/vocablens/failures: read hidden/ (and lens/) from this run's "
                         "folder instead of --out_dir, e.g. runs/run2")
     p.add_argument("--analyze", action="store_true",
                    help="with --mode lens: plot saved lens data, no model load; with "
@@ -2052,6 +2354,8 @@ def main():
         plot_tunedlens(args.out_dir) if args.analyze else run_tunedlens(args)
     elif args.mode == "vocablens":
         plot_vocablens(args.out_dir) if args.analyze else run_vocablens(args)
+    elif args.mode == "failures":
+        run_failures(args)
     elif args.mode == "lens" and args.analyze:
         analyze_lens(args)
     else:

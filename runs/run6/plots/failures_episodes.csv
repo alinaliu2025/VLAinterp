@@ -1,0 +1,51 @@
+task_id,init_idx,success,label,num_steps,idle_steps,n_close,max_lift,lift_step,distractor_lift,final_xy_to_plate,final_z_above_plate,final_gap,still_at_end,first_close_step,close_dist,close_dxy,close_dz,close_nearest,close_nearest_dist,instruction
+0,0,1,success,85,13,1,0.1233,59,0.0000,0.0147,0.0162,0.0048,0,44,0.0796,0.0544,0.0581,akita_black_bowl_1,0.0796,pick up the black bowl between the plate and the ramekin and place it on the plate
+0,1,1,success,141,58,1,0.0966,121,0.0000,0.0106,0.0157,0.0057,0,104,0.1019,0.0655,0.0780,akita_black_bowl_1,0.1019,pick up the black bowl between the plate and the ramekin and place it on the plate
+0,2,1,success,85,5,2,0.1111,59,0.0000,0.0084,0.0157,0.0109,0,35,0.1014,0.0616,0.0806,akita_black_bowl_1,0.1014,pick up the black bowl between the plate and the ramekin and place it on the plate
+0,3,1,success,190,80,1,0.1154,166,0.0000,0.0283,0.0152,0.0140,0,148,0.0628,0.0541,0.0319,akita_black_bowl_1,0.0628,pick up the black bowl between the plate and the ramekin and place it on the plate
+0,4,1,success,81,3,2,0.1159,51,0.0000,0.0176,0.0094,0.0050,0,33,0.0659,0.0479,0.0453,akita_black_bowl_1,0.0659,pick up the black bowl between the plate and the ramekin and place it on the plate
+1,0,1,success,114,4,1,0.1552,70,0.0000,0.0255,0.0095,0.0050,0,54,0.0572,0.0496,0.0285,akita_black_bowl_1,0.0572,pick up the black bowl next to the ramekin and place it on the plate
+1,1,1,success,105,4,1,0.1859,63,0.0000,0.0178,0.0147,0.0049,0,46,0.0519,0.0297,0.0425,akita_black_bowl_1,0.0519,pick up the black bowl next to the ramekin and place it on the plate
+1,2,1,success,130,6,1,0.1791,82,0.0000,0.0266,0.0082,0.0054,0,58,0.0460,0.0405,0.0217,akita_black_bowl_1,0.0460,pick up the black bowl next to the ramekin and place it on the plate
+1,3,1,success,146,4,2,0.1922,68,0.0000,0.0302,0.0139,0.0760,0,45,0.0738,0.0380,0.0633,akita_black_bowl_1,0.0738,pick up the black bowl next to the ramekin and place it on the plate
+1,4,1,success,122,9,1,0.1545,82,0.0000,0.0056,0.0155,0.0050,0,66,0.0373,0.0287,0.0238,akita_black_bowl_1,0.0373,pick up the black bowl next to the ramekin and place it on the plate
+2,0,0,missed_grasp,220,45,7,0.0025,-1,0.0001,0.2472,-0.0119,0.0765,0,113,0.0928,0.0600,0.0707,akita_black_bowl_1,0.0928,pick up the black bowl from table center and place it on the plate
+2,1,1,success,112,9,1,0.1476,72,0.0000,0.0099,0.0079,0.0037,0,57,0.0528,0.0509,0.0139,akita_black_bowl_1,0.0528,pick up the black bowl from table center and place it on the plate
+2,2,1,success,102,5,2,0.1757,58,0.0000,0.0082,0.0116,0.0041,0,33,0.0771,0.0482,0.0602,akita_black_bowl_1,0.0771,pick up the black bowl from table center and place it on the plate
+2,3,1,success,98,4,1,0.1333,54,0.0000,0.0020,0.0059,0.0065,0,31,0.0886,0.0600,0.0652,akita_black_bowl_1,0.0886,pick up the black bowl from table center and place it on the plate
+2,4,1,success,129,34,1,0.1471,87,0.0000,0.0074,0.0153,0.0049,0,68,0.0427,0.0334,0.0267,akita_black_bowl_1,0.0427,pick up the black bowl from table center and place it on the plate
+3,0,1,success,82,5,2,0.0945,60,0.0000,0.0058,0.0110,0.0042,0,42,0.0718,0.0372,0.0615,akita_black_bowl_1,0.0718,pick up the black bowl on the cookie box and place it on the plate
+3,1,1,success,94,18,1,0.1097,70,0.0000,0.0279,0.0132,0.0035,0,54,0.0664,0.0395,0.0534,akita_black_bowl_1,0.0664,pick up the black bowl on the cookie box and place it on the plate
+3,2,1,success,86,4,2,0.1048,54,0.0000,0.0261,0.0091,0.0172,0,39,0.0686,0.0471,0.0499,akita_black_bowl_1,0.0686,pick up the black bowl on the cookie box and place it on the plate
+3,3,1,success,95,25,1,0.0939,72,0.0000,0.0086,0.0180,0.0048,0,58,0.0539,0.0462,0.0278,akita_black_bowl_1,0.0539,pick up the black bowl on the cookie box and place it on the plate
+3,4,1,success,86,9,1,0.0879,62,0.0000,0.0130,0.0190,0.0143,0,47,0.0557,0.0427,0.0358,akita_black_bowl_1,0.0557,pick up the black bowl on the cookie box and place it on the plate
+4,0,1,success,131,5,1,0.1634,68,0.0000,0.0063,0.0071,0.0040,0,52,0.0493,0.0267,0.0414,akita_black_bowl_1,0.0493,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+4,1,1,success,139,4,3,0.1449,83,0.0000,0.0094,0.0103,0.0046,0,59,0.0595,0.0335,0.0491,akita_black_bowl_1,0.0595,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+4,2,0,missed_grasp,220,5,17,0.0076,-1,0.0000,0.3263,0.1601,0.0077,0,46,0.0727,0.0608,0.0397,akita_black_bowl_1,0.0727,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+4,3,0,stuck_holding,220,4,2,0.0062,-1,0.0000,0.3571,0.1648,0.0215,1,58,0.0686,0.0386,0.0568,akita_black_bowl_1,0.0686,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+4,4,1,success,136,6,2,0.1686,78,0.0000,0.0287,0.0161,0.0046,0,60,0.0452,0.0365,0.0267,akita_black_bowl_1,0.0452,pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+5,0,1,success,102,11,1,0.1272,61,0.0000,0.0102,0.0166,0.0038,0,40,0.0865,0.0659,0.0561,akita_black_bowl_1,0.0865,pick up the black bowl on the ramekin and place it on the plate
+5,1,1,success,91,6,1,0.1316,52,0.0000,0.0087,0.0217,0.0064,0,33,0.0688,0.0485,0.0487,akita_black_bowl_1,0.0688,pick up the black bowl on the ramekin and place it on the plate
+5,2,1,success,83,3,2,0.1221,49,0.0000,0.0206,0.0104,0.0049,0,26,0.0664,0.0478,0.0461,akita_black_bowl_1,0.0664,pick up the black bowl on the ramekin and place it on the plate
+5,3,1,success,83,4,1,0.1221,52,0.0000,0.0181,0.0145,0.0045,0,32,0.0743,0.0587,0.0456,akita_black_bowl_1,0.0743,pick up the black bowl on the ramekin and place it on the plate
+5,4,1,success,87,4,1,0.1544,45,0.0000,0.0164,0.0207,0.0042,0,29,0.0859,0.0565,0.0647,akita_black_bowl_1,0.0859,pick up the black bowl on the ramekin and place it on the plate
+6,0,1,success,102,5,1,0.1428,64,0.0000,0.0085,0.0174,0.0052,0,46,0.0639,0.0522,0.0368,akita_black_bowl_1,0.0639,pick up the black bowl next to the cookie box and place it on the plate
+6,1,0,released_near_plate,220,4,2,0.1070,65,0.0000,0.0323,0.0076,0.0799,0,48,0.0801,0.0593,0.0539,akita_black_bowl_1,0.0801,pick up the black bowl next to the cookie box and place it on the plate
+6,2,1,success,102,6,2,0.1342,66,0.0000,0.0031,0.0119,0.0041,0,49,0.0432,0.0396,0.0173,akita_black_bowl_1,0.0432,pick up the black bowl next to the cookie box and place it on the plate
+6,3,1,success,98,4,1,0.1251,64,0.0000,0.0270,0.0139,0.0052,0,48,0.0505,0.0384,0.0327,akita_black_bowl_1,0.0505,pick up the black bowl next to the cookie box and place it on the plate
+6,4,1,success,99,5,1,0.1335,65,0.0000,0.0232,0.0158,0.0049,0,49,0.0549,0.0488,0.0250,akita_black_bowl_1,0.0549,pick up the black bowl next to the cookie box and place it on the plate
+7,0,1,success,106,6,1,0.1177,50,0.0000,0.0097,0.0165,0.0049,0,31,0.0725,0.0695,0.0209,akita_black_bowl_1,0.0725,pick up the black bowl on the stove and place it on the plate
+7,1,1,success,120,8,2,0.1261,60,0.0000,0.0094,0.0130,0.0237,0,34,0.0497,0.0454,0.0203,akita_black_bowl_1,0.0497,pick up the black bowl on the stove and place it on the plate
+7,2,1,success,169,8,2,0.2000,72,0.0000,0.0308,0.0070,0.0779,0,37,0.0546,0.0523,0.0159,akita_black_bowl_1,0.0546,pick up the black bowl on the stove and place it on the plate
+7,3,0,closed_away,220,9,16,0.0000,-1,0.0000,0.4588,0.0230,0.0210,0,41,0.2706,0.2610,0.0716,glazed_rim_porcelain_ramekin_1,0.1695,pick up the black bowl on the stove and place it on the plate
+7,4,1,success,117,6,1,0.1706,56,0.0000,0.0070,0.0129,0.0085,0,28,0.0734,0.0642,0.0356,akita_black_bowl_1,0.0734,pick up the black bowl on the stove and place it on the plate
+8,0,1,success,130,42,1,0.0968,108,0.0000,0.0203,0.0180,0.0044,0,93,0.0694,0.0478,0.0503,akita_black_bowl_1,0.0694,pick up the black bowl next to the plate and place it on the plate
+8,1,1,success,122,6,4,0.1565,67,0.0000,0.0150,0.0113,0.0168,0,49,0.0629,0.0412,0.0475,akita_black_bowl_1,0.0629,pick up the black bowl next to the plate and place it on the plate
+8,2,0,closed_away,220,6,9,0.0000,-1,0.0000,0.1520,-0.0041,0.0751,0,62,0.1451,0.1248,0.0739,plate_1,0.0776,pick up the black bowl next to the plate and place it on the plate
+8,3,1,success,109,6,2,0.1515,63,0.0000,0.0251,0.0148,0.0235,0,45,0.0635,0.0506,0.0384,akita_black_bowl_1,0.0635,pick up the black bowl next to the plate and place it on the plate
+8,4,0,closed_away,220,14,5,0.0062,-1,0.0000,0.1799,-0.0034,0.0010,1,54,0.1614,0.1147,0.1136,plate_1,0.1258,pick up the black bowl next to the plate and place it on the plate
+9,0,1,success,121,5,3,0.1235,63,0.0000,0.0270,0.0107,0.0073,0,46,0.0487,0.0452,0.0182,akita_black_bowl_1,0.0487,pick up the black bowl on the wooden cabinet and place it on the plate
+9,1,0,released_near_plate,220,6,2,0.1256,79,0.0000,0.0461,0.0102,0.0798,1,59,0.0528,0.0418,0.0322,akita_black_bowl_1,0.0528,pick up the black bowl on the wooden cabinet and place it on the plate
+9,2,1,success,118,6,1,0.0891,66,0.0000,0.0150,0.0130,0.0043,0,50,0.0710,0.0699,0.0122,akita_black_bowl_1,0.0710,pick up the black bowl on the wooden cabinet and place it on the plate
+9,3,1,success,123,4,1,0.1266,63,0.0000,0.0078,0.0082,0.0049,0,46,0.0479,0.0361,0.0315,akita_black_bowl_1,0.0479,pick up the black bowl on the wooden cabinet and place it on the plate
+9,4,1,success,129,5,2,0.1351,65,0.0000,0.0267,0.0197,0.0194,0,51,0.0455,0.0430,0.0146,akita_black_bowl_1,0.0455,pick up the black bowl on the wooden cabinet and place it on the plate
