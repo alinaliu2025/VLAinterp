@@ -45,8 +45,8 @@ def curves(args):
     os.makedirs(args.out_dir, exist_ok=True)
     for name in args.sets:
         layers, real, shuf = load_curves(args.csv_dir, name)
-        fig, ax = new_axes(f"TDNV by layer ({name} instructions, 10 images x 10 instructions)",
-                           "TDNV (log scale)")
+        fig, ax = new_axes(f"TDNV by layer ({name} instructions, 10 images x 10 instructions)"
+                           + (f"\n{args.label}" if args.label else ""), "TDNV (log scale)")
         # The two shuffled curves agree within a few percent: draw one chance line
         chance = (shuf["exp1_by_image"] + shuf["exp2_by_instruction"]) / 2
         ax.plot(layers, chance, color=MUTED, linewidth=1.6, linestyle=":",
@@ -108,7 +108,8 @@ def scatter(args):
                            linewidths=1.5 if hollow else 0.6, alpha=0.9)
             ax.set_xticks([]), ax.set_yticks([])
             ax.set_aspect("equal", adjustable="datalim")
-            ax.set_title(f"layer {l}, colored by {by}\nTDNV {val:.4g}   "
+            ax.set_title((f"{args.label}\n" if args.label else "") +
+                         f"layer {l}, colored by {by}\nTDNV {val:.4g}   "
                          f"(PC1 {ev[0]:.0%}, PC2 {ev[1]:.0%} of variance)",
                          fontsize=11, color=INK, loc="left")
             handles = [Line2D([], [], linestyle="", marker=MARKERS[g], markersize=7,
@@ -137,6 +138,8 @@ def main():
     s.add_argument("--init", type=int, default=0)
     s.add_argument("--panels", default="3:image,7:instruction,31:image",
                    help="comma list of layer:image|instruction")
+    for sp in (c, s):
+        sp.add_argument("--label", default="", help="extra title line, e.g. the model")
     args = p.parse_args()
     curves(args) if args.cmd == "curves" else scatter(args)
 

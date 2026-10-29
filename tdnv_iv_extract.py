@@ -68,9 +68,14 @@ def main():
     set_seed_everywhere(cfg.get("seed", SEED))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor, model, dtype = load_model(cfg["model_id"], BASE_REPO, device)
-    unnorm_key = cfg["suite"]
+    # "suite" picks the scenes; "unnorm_key" (default: the suite) picks the action
+    # stats, so another checkpoint can see the same scenes. Hidden states don't use it.
+    unnorm_key = cfg.get("unnorm_key", cfg["suite"])
     if unnorm_key not in model.norm_stats and f"{unnorm_key}_no_noops" in model.norm_stats:
         unnorm_key = f"{unnorm_key}_no_noops"
+    if unnorm_key not in model.norm_stats:
+        raise SanityCheckError(f"unnorm_key {unnorm_key} not in {sorted(model.norm_stats)}")
+    print(f"[info] unnorm_key = {unnorm_key}", flush=True)
     n_layers = len(find_decoder_layers(model))
 
     suite = benchmark.get_benchmark_dict()[cfg["suite"]]()
