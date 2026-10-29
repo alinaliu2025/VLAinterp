@@ -19,6 +19,10 @@ Batch experiments on OpenVLA + LIBERO, built on top of singleVLA.py.
     --mode vocablens --analyze   replot saved vocab-lens results (CPU)
     --mode failures         label what went wrong in each failed episode from the
                             saved simulator state (CPU, no model); --src_dir as above
+    --mode failprobe        ridge probes (trained on successes) for where the gripper,
+                            target bowl and plate are, read on the failed episodes
+                            (CPU, no model); --src_dir as above
+    --mode failprobe --analyze   plots from the saved probe predictions (CPU)
 
 Modes say WHAT the script does. Runs are numbered jobs (run0, run1, ...), each
 with its own folder runs/runN/ passed as --out_dir; see runs/RUNS.md.
@@ -54,6 +58,7 @@ Output layout (out_dir is required, e.g. runs/run1):
     tunedlens/results.npz                 --mode tunedlens: metrics, out-of-fold argmax
     vocablens/readout.npz                 --mode vocablens: cached full lm_head + final norm + token strings
     vocablens/results.npz                 --mode vocablens: per-step, per-layer group masses, top tokens
+    failprobe/results.npz                 --mode failprobe: per-step, per-layer probe predictions
 """
 
 import argparse
@@ -2299,12 +2304,320 @@ def run_failures(args):
 
 
 # ---------------------------------------------------------------------------
+# --mode failprobe: where does the model think the gripper, bowl and plate are,
+# in the episodes that failed? (CPU, no model)
+# ---------------------------------------------------------------------------
+#
+# Ridge probes, trained on SUCCESSFUL episodes only, read three 3-D positions
+# out of each layer's hidden state at the first-action-token position: the
+# gripper (eef), the target bowl and the plate. Gripper-to-bowl and
+# gripper-to-plate offsets are differences of those predictions. A failed
+# episode is never in the training set, so its predictions say what the model
+# encodes when it fails, measured against what it encodes when it succeeds.
+#
+# Two fold schemes:
+#   task     leave one TASK out. The headline. Each libero_spatial task has its
+#            own layout, so a probe that saw other inits of the same task could
+#            output "task 8's bowl position" from the instruction alone, right
+#            even when the model is confused. Holding out the whole task forces
+#            the probe to read the position from what the model encodes.
+#   episode  5 folds by episode (other inits of the same task are in training);
+#            failures are predicted by a probe fit on all successes. Shown for
+#            comparison: the gap between the two is how much is task identity.
+
+FP_TARGETS = {"eef": "eef_pos", "bowl": FAIL_TARGET, "plate": FAIL_PLATE}
+FP_SCHEMES = ["task", "episode"]
+
+
+def load_failprobe_data(src):
+    """Hidden states, the 9 position targets and per-episode failure labels."""
+    episodes = read_episodes_csv(os.path.join(src, "episodes.csv"))
+    if not episodes:
+        sys.exit(f"[error] no episodes.csv in {src}")
+    H, Y, ep_of_step, step, eps = [], [], [], [], []
+    for e, ((t, i), ep) in enumerate(sorted(episodes.items())):
+        d = np.load(os.path.join(src, "hidden", episode_stem(t, i) + ".npz"))
+        success = int(ep["success"])
+        f = failure_features(d)
+        H.append(d["hidden"])
+        Y.append(np.concatenate([d[k] for k in FP_TARGETS.values()], 1))
+        ep_of_step.append(np.full(f["num_steps"], e))
+        step.append(np.arange(f["num_steps"]))
+        eps.append({"task_id": t, "init_idx": i, "success": success,
+                    "label": failure_label(f, success), "first_close": f["first_close_step"]})
+    H = np.concatenate(H)
+    print(f"[info] {len(eps)} episodes ({sum(e['success'] for e in eps)} successful), "
+          f"{len(H)} steps, hidden {H.shape[1:]} ({H.nbytes / 1e9:.1f} GB in RAM)")
+    return (H, np.concatenate(Y).astype(np.float64), np.concatenate(ep_of_step),
+            np.concatenate(step), eps)
+
+
+def run_failprobe(args):
+    from sklearn.linear_model import RidgeCV
+    from sklearn.model_selection import GroupKFold
+
+    src = args.src_dir or args.out_dir
+    out = os.path.join(args.out_dir, "failprobe")
+    os.makedirs(out, exist_ok=True)
+    H, Y, ep_of_step, step, eps = load_failprobe_data(src)
+    n, n_lay = H.shape[:2]
+    layers = np.arange(0, n_lay, args.layer_stride)
+    if layers[-1] != n_lay - 1:
+        layers = np.r_[layers, n_lay - 1]
+    alphas = np.logspace(-1, 5, 13)
+    task = np.array([eps[e]["task_id"] for e in ep_of_step])
+    ok = np.array([eps[e]["success"] for e in ep_of_step], dtype=bool)
+    succ, fail = np.flatnonzero(ok), np.flatnonzero(~ok)
+
+    # (train rows, rows to predict) per fit, for each scheme.
+    fits = {"task": [], "episode": []}
+    for k in np.unique(task):
+        fits["task"].append((succ[task[succ] != k], np.flatnonzero(task == k)))
+    for tr, te in GroupKFold(n_splits=5).split(succ, groups=ep_of_step[succ]):
+        fits["episode"].append((succ[tr], succ[te]))
+    fits["episode"].append((succ, fail))
+    for s in FP_SCHEMES:
+        covered = np.zeros(n, int)
+        for tr, te in fits[s]:
+            covered[te] += 1
+            if np.isin(te, tr).any() or not ok[tr].all():
+                raise SanityCheckError(f"{s} folds: a predicted step is in its own training "
+                                       "set, or a failed step is in training")
+        if not (covered == 1).all():
+            raise SanityCheckError(f"{s} folds: {np.sum(covered != 1)} steps not predicted "
+                                   "exactly once")
+
+    pred = {s: np.full((n, len(layers), Y.shape[1]), np.nan, np.float32) for s in FP_SCHEMES}
+    t0 = time.time()
+    for li, layer in enumerate(layers):
+        X = H[:, layer].astype(np.float32)
+        for s in FP_SCHEMES:
+            for tr, te in fits[s]:
+                # Standardize with TRAIN statistics only.
+                mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-6
+                model = RidgeCV(alphas=alphas, alpha_per_target=True)
+                model.fit((X[tr] - mu) / sd, Y[tr])
+                pred[s][te, li] = model.predict((X[te] - mu) / sd)
+        print(f"  layer {layer:2d} done ({(time.time() - t0) / 60:.1f} min)", flush=True)
+
+    # Layer 0 is the same token embedding at every step: no position signal.
+    if np.ptp(H[:, 0].astype(np.float32), axis=0).max() > 1e-3:
+        raise SanityCheckError("layer 0 hidden state differs between steps")
+    save_npz_atomic(
+        os.path.join(out, "results.npz"),
+        layers=layers, Y=Y.astype(np.float32), pred_task=pred["task"],
+        pred_episode=pred["episode"], episode=ep_of_step, step=step,
+        ep_task=np.array([e["task_id"] for e in eps]),
+        ep_init=np.array([e["init_idx"] for e in eps]),
+        ep_success=np.array([e["success"] for e in eps]),
+        ep_label=np.array([e["label"] for e in eps]),
+        ep_first_close=np.array([e["first_close"] for e in eps]),
+        targets=np.array(list(FP_TARGETS)), src_dir=np.array(src))
+    print(f"[info] saved {out}/results.npz")
+
+
+def fp_r2(true, pred, rows):
+    """Held-out R^2 pooled over the 3 coordinates of a position."""
+    t, p = true[rows], pred[rows]
+    return 1 - ((t - p) ** 2).sum() / ((t - t.mean(0)) ** 2).sum()
+
+
+def plot_failprobe(out_dir):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    r = np.load(os.path.join(out_dir, "failprobe", "results.npz"))
+    plots = os.path.join(out_dir, "plots")
+    os.makedirs(plots, exist_ok=True)
+    layers, Y, ep, step = r["layers"], r["Y"], r["episode"], r["step"]
+    ok = r["ep_success"][ep].astype(bool)
+    succ = np.flatnonzero(ok)
+
+    def split(A):        # [..., 9] -> eef, bowl, plate, each [..., 3]
+        return A[..., 0:3], A[..., 3:6], A[..., 6:9]
+
+    true = dict(zip(["eef", "bowl", "plate"], split(Y)))
+    true["to_bowl"] = true["bowl"] - true["eef"]
+    true["to_plate"] = true["plate"] - true["eef"]
+    P = {}
+    for s in FP_SCHEMES:
+        e, b, p = split(r[f"pred_{s}"])
+        P[s] = {"eef": e, "bowl": b, "plate": p, "to_bowl": b - e, "to_plate": p - e}
+    names = ["eef", "bowl", "plate", "to_bowl"]
+    r2 = {f"{s}_{k}": np.array([fp_r2(true[k], P[s][k][:, li], succ)
+                                for li in range(len(layers))])
+          for s in FP_SCHEMES for k in names}
+    write_layer_csv(os.path.join(plots, "failprobe_r2.csv"), r2)
+    # Layer used for the per-episode plots: best gripper->bowl offset, task folds.
+    best = int(np.argmax(np.nan_to_num(r2["task_to_bowl"], nan=-np.inf)))
+    L = int(layers[best])
+
+    # 1. Held-out R^2 on successful episodes, by layer.
+    colors = {"eef": "#2a78d6", "bowl": "#eb6834", "plate": "#1baf7a", "to_bowl": INK}
+    fig, ax = new_axes("Position probes on successful episodes: held-out R² by layer",
+                       "held-out R² (3-D, pooled)")
+    for k in names:
+        ax.plot(layers, r2[f"task_{k}"], color=colors[k], lw=1.8,
+                label=f"{k}, leave-one-task-out")
+        ax.plot(layers, r2[f"episode_{k}"], color=colors[k], lw=1.2, ls="--",
+                label=f"{k}, by episode (same task seen)")
+    ax.axvline(L, color=MUTED, lw=0.8, ls=":")
+    ax.set_ylim(-0.5, 1.02)
+    ax.axhline(0, color=MUTED, lw=0.8)
+    ax.legend(frameon=False, fontsize=8, bbox_to_anchor=(1.01, 1), loc="upper left")
+    fig.set_size_inches(11, 5)
+    save_fig(fig, os.path.join(plots, "failprobe_r2.png"))
+
+    # 2. At the first close command: true vs probed gripper->bowl distance.
+    def at_close(s, li):
+        rows = []
+        for e in range(len(r["ep_success"])):
+            t = r["ep_first_close"][e]
+            if t < 0:
+                continue
+            k = np.flatnonzero((ep == e) & (step == t))[0]
+            rows.append({
+                "task_id": int(r["ep_task"][e]), "init_idx": int(r["ep_init"][e]),
+                "success": int(r["ep_success"][e]), "label": str(r["ep_label"][e]),
+                "step": int(t),
+                "true_d_bowl": float(np.linalg.norm(true["to_bowl"][k])),
+                "probe_d_bowl": float(np.linalg.norm(P[s]["to_bowl"][k, li])),
+                "true_d_plate": float(np.linalg.norm(true["to_plate"][k])),
+                "probe_d_plate": float(np.linalg.norm(P[s]["to_plate"][k, li])),
+                "bowl_err": float(np.linalg.norm(P[s]["bowl"][k, li] - true["bowl"][k])),
+                "probe_bowl_to_true_plate": float(np.linalg.norm(
+                    P[s]["bowl"][k, li] - true["plate"][k])),
+                "eef_err": float(np.linalg.norm(P[s]["eef"][k, li] - true["eef"][k]))})
+        return rows
+
+    path = os.path.join(plots, "failprobe_close.csv")
+    with open(path, "w", newline="") as fh:
+        w = None
+        for s in FP_SCHEMES:
+            for li, layer in enumerate(layers):
+                for row in at_close(s, li):
+                    row = {"scheme": s, "layer": int(layer), **row}
+                    if w is None:
+                        w = csv.DictWriter(fh, fieldnames=list(row))
+                        w.writeheader()
+                    w.writerow({k: f"{v:.4f}" if isinstance(v, float) else v
+                                for k, v in row.items()})
+    print(f"[csv]  {path}")
+
+    rows = at_close("task", best)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4))
+    for ax, key, what in [(axes[0], "d_bowl", "gripper → target bowl"),
+                          (axes[1], "d_plate", "gripper → plate")]:
+        s_rows = [x for x in rows if x["success"]]
+        ax.scatter([x[f"true_{key}"] for x in s_rows], [x[f"probe_{key}"] for x in s_rows],
+                   s=22, color=MUTED, alpha=0.6, label=f"success ({len(s_rows)})")
+        for x in rows:
+            if x["success"]:
+                continue
+            c = FAIL_COLORS.get(x["label"], INK)
+            ax.scatter(x[f"true_{key}"], x[f"probe_{key}"], s=60, color=c, edgecolor=INK,
+                       linewidth=0.5, zorder=3)
+            ax.annotate(f"t{x['task_id']}/i{x['init_idx']} {x['label']}",
+                        (x[f"true_{key}"], x[f"probe_{key}"]), xytext=(5, 4),
+                        textcoords="offset points", fontsize=8, color=c)
+        lim = max(0.05, max(max(x[f"true_{key}"], x[f"probe_{key}"]) for x in rows)) * 1.08
+        ax.plot([0, lim], [0, lim], color=MUTED, lw=0.8, ls=":")
+        ax.set_xlim(0, lim)
+        ax.set_ylim(0, lim)
+        ax.set_aspect("equal")
+        ax.set_xlabel(f"true distance {what} (m)", color=MUTED)
+        ax.set_ylabel(f"probe's distance {what} (m)", color=MUTED)
+        ax.set_title(what, loc="left", fontsize=11, color=INK)
+        ax.grid(True, color=GRID, linewidth=0.6)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.legend(frameon=False, fontsize=9, loc="upper left")
+    fig.suptitle(f"At the first close command: true vs probed distance "
+                 f"(layer {L}, leave-one-task-out; on the dotted line = probe agrees)",
+                 x=0.01, ha="left", fontsize=12, color=INK)
+    save_fig(fig, os.path.join(plots, "failprobe_close.png"))
+
+    # 3. Each failed episode over time: true vs probed distances.
+    fails = [e for e in range(len(r["ep_success"])) if not r["ep_success"][e]]
+    if fails:
+        ncol = min(4, len(fails))
+        nrow = -(-len(fails) // ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.4 * nrow),
+                                 squeeze=False, sharey=True)
+        for ax, e in zip(axes.flat, fails):
+            rows_e = np.flatnonzero(ep == e)
+            for key, c, what in [("to_bowl", "#2a78d6", "bowl"),
+                                 ("to_plate", "#1baf7a", "plate")]:
+                ax.plot(np.linalg.norm(true[key][rows_e], axis=1), color=c, lw=1.6,
+                        label=f"gripper→{what}, true")
+                ax.plot(np.linalg.norm(P["task"][key][rows_e, best], axis=1), color=c,
+                        lw=1.2, ls="--", label=f"gripper→{what}, probe")
+            t = r["ep_first_close"][e]
+            if t >= 0:
+                ax.axvline(t, color=INK, lw=0.8, ls=":", label="first close")
+            lab = str(r["ep_label"][e])
+            ax.set_title(f"task {r['ep_task'][e]} init {r['ep_init'][e]}: {lab}", loc="left",
+                         fontsize=10, color=FAIL_COLORS.get(lab, INK))
+            ax.set_ylim(0, 0.6)
+            ax.grid(True, color=GRID, linewidth=0.6)
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+            ax.tick_params(colors=MUTED, labelsize=8)
+        for ax in axes.flat[len(fails):]:
+            ax.axis("off")
+        for ax in axes[:, 0]:
+            ax.set_ylabel("meters", color=MUTED)
+        for ax in axes[-1]:
+            ax.set_xlabel("env step", color=MUTED)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False,
+                   fontsize=9)
+        fig.suptitle(f"Failed episodes: true vs probed distances (layer {L}, "
+                     f"leave-one-task-out)", x=0.01, ha="left", fontsize=12, color=INK)
+        fig.tight_layout(rect=(0, 0.06, 1, 0.96))
+        path = os.path.join(plots, "failprobe_timelines.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[plot] {path}")
+
+    # Summary: how far off the probe is at the first close, successes vs failures.
+    srows = [x for x in rows if x["success"]]
+    ref = np.array([abs(x["probe_d_bowl"] - x["true_d_bowl"]) for x in srows])
+    path = os.path.join(plots, "failprobe_summary.csv")
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["quantity", "value"])
+        w.writerow(["layer_used", L])
+        for k in names:
+            w.writerow([f"r2_task_{k}_at_layer", f"{r2[f'task_{k}'][best]:.4f}"])
+            w.writerow([f"r2_episode_{k}_at_layer", f"{r2[f'episode_{k}'][best]:.4f}"])
+        if len(ref):
+            w.writerow(["success_abs_err_d_bowl_at_close_median", f"{np.median(ref):.4f}"])
+            w.writerow(["success_abs_err_d_bowl_at_close_p90", f"{np.percentile(ref, 90):.4f}"])
+    print(f"[csv]  {path}")
+    print(f"[info] layer {L}: leave-one-task-out R² " + ", ".join(
+        f"{k} {r2[f'task_{k}'][best]:.3f}" for k in names) + " | by episode " + ", ".join(
+        f"{k} {r2[f'episode_{k}'][best]:.3f}" for k in names))
+    if len(ref):
+        print(f"[info] successes at first close: |probe - true| gripper→bowl distance "
+              f"median {np.median(ref):.3f} m, 90th pct {np.percentile(ref, 90):.3f} m")
+    for x in rows:
+        if not x["success"]:
+            print(f"[info]   task {x['task_id']} init {x['init_idx']} {x['label']:<20s} at close: "
+                  f"to bowl true {x['true_d_bowl']:.3f} probe {x['probe_d_bowl']:.3f} | "
+                  f"to plate true {x['true_d_plate']:.3f} probe {x['probe_d_plate']:.3f} | "
+                  f"probed bowl is {x['bowl_err']:.3f} m from the bowl, "
+                  f"{x['probe_bowl_to_true_plate']:.3f} m from the plate")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=["rollout", "lens", "probe", "patchlens", "tunedlens",
-                                      "vocablens", "failures"],
+                                      "vocablens", "failures", "failprobe"],
                    required=True)
     p.add_argument("--suite", default="libero_spatial", choices=list(MAX_STEPS))
     p.add_argument("--tasks", default="0-9", help='task ids, e.g. "0-9" or "0,3,5"')
@@ -2313,11 +2626,11 @@ def main():
                    help="this run's folder, e.g. runs/run1")
     p.add_argument("--save_video", action="store_true")
     p.add_argument("--src_dir", default=None,
-                   help="--mode probe/tunedlens/vocablens/failures: read hidden/ (and lens/) from this run's "
+                   help="--mode probe/tunedlens/vocablens/failures/failprobe: read hidden/ (and lens/) from this run's "
                         "folder instead of --out_dir, e.g. runs/run2")
     p.add_argument("--analyze", action="store_true",
                    help="with --mode lens: plot saved lens data, no model load; with "
-                        "--mode tunedlens/vocablens: replot saved results")
+                        "--mode tunedlens/vocablens/failprobe: replot saved results")
     p.add_argument("--dry_run", action="store_true",
                    help="1 task, 1 init, 20 steps")
     p.add_argument("--model_id", default=None,
@@ -2325,7 +2638,7 @@ def main():
     p.add_argument("--max_steps", type=int, default=None,
                    help="override the official per-suite step budget")
     p.add_argument("--layer_stride", type=int, default=1,
-                   help="--mode probe/tunedlens: every Nth layer (1 = all)")
+                   help="--mode probe/tunedlens/failprobe: every Nth layer (1 = all)")
     p.add_argument("--tl_variants", default=TL_VARIANTS,
                    help="--mode tunedlens: comma-separated translator variants")
     p.add_argument("--tl_folds", type=int, default=5,
@@ -2356,6 +2669,8 @@ def main():
         plot_vocablens(args.out_dir) if args.analyze else run_vocablens(args)
     elif args.mode == "failures":
         run_failures(args)
+    elif args.mode == "failprobe":
+        plot_failprobe(args.out_dir) if args.analyze else run_failprobe(args)
     elif args.mode == "lens" and args.analyze:
         analyze_lens(args)
     else:
