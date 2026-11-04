@@ -29,6 +29,24 @@ space, using the per-pair TDNV term (var_t + var_t') / (2 ||mu_t - mu_t'||^2)
   - --line a,b,c: is b's center on the segment from a's to c's?
   - stability: Spearman correlation of each init's pair terms with init 0's
 Figures (init 0): heatmap ordered by --order, dendrogram, word-overlap curve.
+
+Linear probes (CPU, needs the hidden states, so run on OSC):
+    python tdnv_present.py probe --grid runs/run5/grid/generic.npz --out_dir runs/run10/run5
+
+`probe` fits a linear readout (4096 -> 10, ridge regression on one-hot labels,
+features standardized on the training rows) at every readout, for the scene and
+for the instruction, and scores it on held-out rows:
+  - v1 new placements: train on inits other than --test_init, test on --test_init
+    (every scene x instruction combination is seen in training)
+  - v2 new partner: the scene probe is tested on instructions it never saw, the
+    instruction probe on scenes it never saw; partners held out two at a time,
+    every partner once (5 folds). Tested on --test_init only, and training leaves
+    out that init too, so every test image is also a new placement
+The ridge strength is picked by cross-validation inside the training rows, with
+inner folds held out the same way as the outer test (by init for v1, by partner
+pair for v2). Control: the same procedure with the training labels shuffled
+(--n_shuffle times, averaged). Readout 0 is identical for every input, so its
+accuracy must be exactly chance (checked).
 """
 
 import argparse
@@ -324,6 +342,7 @@ def groups(args):
     im = ax.imshow(M, cmap=cmap)
     ax.set_xticks(range(K), [str(i) for i in order], color=MUTED, fontsize=9)
     ax.set_yticks(range(K), [f"{i}: {instructions[i]}" for i in order], color=INK, fontsize=9)
+    ax.xaxis.tick_top()                                   # column labels above the matrix
     ax.tick_params(length=0)
     for s in ax.spines.values():
         s.set_visible(False)
@@ -340,7 +359,7 @@ def groups(args):
     cb.set_label("log10 pair TDNV term (darker = harder to separate)", color=MUTED)
     cb.outline.set_visible(False)
     ax.set_title(f"Layer {l}: pair TDNV terms between instructions (init {i0}, "
-                 f"TDNV = {np.nansum(P[i0]):.3g}){title_extra}", loc="left", fontsize=11, color=INK)
+                 f"TDNV = {np.nansum(P[i0]):.3g}){title_extra}", loc="left", fontsize=11, color=INK, pad=16)
     path = os.path.join(args.out_dir, f"groups_{tag}_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")       # long row labels: save_fig would clip them
     plt.close(fig)
@@ -384,6 +403,135 @@ def groups(args):
     print(f"[csv]  {path}")
 
 
+RIDGE_LAMBDAS = np.logspace(-4, 2, 13)          # relative to the mean kernel diagonal
+PROBE_LAYERS = (3, 7, 12, 31)
+
+
+def standardize(Xtr, Xte):
+    mu, sd = Xtr.mean(0), Xtr.std(0)
+    sd[sd < 1e-8] = 1.0                           # constant features stay at 0
+    return (Xtr - mu) / sd, (Xte - mu) / sd
+
+
+def ridge_scores(Xtr, Ytr, Xte, lams):
+    """Dual ridge, W = Xtr^T (K + lam I)^-1 Ytr with K = Xtr Xtr^T. Returns [len(lams), n_te, C]."""
+    s, U = np.linalg.eigh(Xtr @ Xtr.T)
+    s = np.clip(s, 0, None)
+    scale = s.mean() if s.mean() > 0 else 1.0
+    UtY, Kte = U.T @ Ytr, Xte @ Xtr.T
+    return np.stack([Kte @ (U @ (UtY / (s + lam * scale)[:, None])) for lam in lams])
+
+
+def fit_predict(Xtr, ytr, Xte, C, lams):
+    Xa, Xb = standardize(Xtr, Xte)
+    Y = np.eye(C)[ytr]
+    m = Y.mean(0)
+    return ridge_scores(Xa, Y - m, Xb, lams) + m
+
+
+def probe_accuracy(X, y, train, test, inner, C, rng=None):
+    """Accuracy on the test rows; ridge strength chosen by inner CV over the `inner` fold ids of the train rows."""
+    ytr = y[train].copy()
+    if rng is not None:
+        ytr = rng.permutation(ytr)
+    folds = inner[train]
+    acc = np.zeros(len(RIDGE_LAMBDAS))
+    for f in np.unique(folds):
+        a, b = folds != f, folds == f
+        acc += (fit_predict(X[train][a], ytr[a], X[train][b], C, RIDGE_LAMBDAS).argmax(-1) == ytr[b]).mean(-1)
+    best = RIDGE_LAMBDAS[np.flatnonzero(acc == acc.max())[-1]]   # ties: the stronger regularization
+    pred = fit_predict(X[train], ytr, X[test], C, [best])[0].argmax(-1)
+    return float((pred == y[test]).mean()), float(best)
+
+
+def probe(args):
+    D = np.load(args.grid)
+    hidden, src = D["hidden"], D["image_src"]                    # [K, M, L+1, d], [M, 2]
+    K, M, n_read, d = hidden.shape
+    layouts = sorted(set(int(t) for t in src[:, 0]))
+    scene_of = np.array([layouts.index(int(t)) for t in src[:, 0]])
+    C = len(layouts)
+    if C != K:
+        raise SystemExit(f"[error] probe expects as many scenes as instructions, got {C} and {K}")
+    # rows: every (instruction, image) pair
+    instr = np.repeat(np.arange(K), M)
+    scene = np.tile(scene_of, K)
+    init = np.tile(src[:, 1], K)
+    rng = np.random.default_rng(args.seed)
+    order = rng.permutation(C)
+    pairs = [order[i:i + 2] for i in range(0, C, 2)]             # partners held out together
+    pair_of = np.empty(C, dtype=int)
+    for j, pr in enumerate(pairs):
+        pair_of[pr] = j
+    print(f"[info] {K} instructions x {M} images = {K * M} rows; test init {args.test_init}; "
+          f"partner pairs {[list(map(int, p)) for p in pairs]}", flush=True)
+
+    targets = {"scene": (scene, instr), "instruction": (instr, scene)}   # (label, its partner)
+    layers = range(n_read) if args.layers is None else [int(l) for l in args.layers.split(",")]
+    rows = []
+    for l in layers:
+        X = hidden[:, :, l].reshape(K * M, d).astype(np.float64)
+        for tname, (y, partner) in targets.items():
+            # v1: new placements, inner folds = the training inits
+            train, test = init != args.test_init, init == args.test_init
+            acc, lam = probe_accuracy(X, y, train, test, init, C)
+            sh = np.mean([probe_accuracy(X, y, train, test, init, C, rng)[0]
+                          for _ in range(args.n_shuffle)])
+            rows.append([l, tname, "v1_new_placements", acc, sh, lam, f"{acc:.3f}"])
+            # v2: new partner at the new placement, one outer fold per partner pair, inner folds =
+            # the other pairs. Training never sees the test partners or the test init.
+            accs, shs, lams = [], [], []
+            for j in range(len(pairs)):
+                held = pair_of[partner] == j
+                test = held & (init == args.test_init)
+                train = ~held & (init != args.test_init)
+                a, lam = probe_accuracy(X, y, train, test, pair_of[partner], C)
+                accs.append(a)
+                lams.append(lam)
+                shs += [probe_accuracy(X, y, train, test, pair_of[partner], C, rng)[0]
+                        for _ in range(args.n_shuffle)]
+            rows.append([l, tname, "v2_new_partner", np.mean(accs), np.mean(shs), np.median(lams),
+                         ";".join(f"{a:.3f}" for a in accs)])
+        if l == 0 and any(abs(r[3] - 1 / C) > 1e-9 for r in rows if r[0] == 0):
+            raise SanityCheckError("readout 0 is identical for every input but a probe beat chance")
+        print(f"[L{l}] " + "  ".join(f"{r[1]}/{r[2][:2]} {r[3]:.2f} (shuf {r[4]:.2f})"
+                                     for r in rows if r[0] == l), flush=True)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    name = os.path.splitext(os.path.basename(args.grid))[0]
+    path = os.path.join(args.out_dir, f"probe_{name}.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["layer", "target", "version", "accuracy", "shuffled_label_accuracy",
+                    "ridge_lambda_rel", "fold_accuracies"])
+        w.writerows([r[:3] + [f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.3g}", r[6]] for r in rows])
+    print(f"[csv]  {path}")
+
+    title_extra = f"\n{args.label}" if args.label else ""
+    fig, ax = new_axes(f"Linear probes: can the scene / instruction be read out? ({name}){title_extra}",
+                       "held-out accuracy")
+    cols = {"scene": EXP_COLORS["exp1_by_image"], "instruction": EXP_COLORS["exp2_by_instruction"]}
+    styles = {"v1_new_placements": ("-", "new placements"), "v2_new_partner": ("--", "new partner + new placement")}
+    for tname in targets:
+        for v, (ls, vname) in styles.items():
+            pts = [(r[0], r[3]) for r in rows if r[1] == tname and r[2] == v]
+            ax.plot(*zip(*pts), color=cols[tname], linestyle=ls, linewidth=2.0, label=f"{tname}, {vname}")
+    shuf = {}
+    for r in rows:
+        shuf.setdefault(r[0], []).append(r[4])
+    ax.plot(sorted(shuf), [np.mean(shuf[l]) for l in sorted(shuf)], color=MUTED, linestyle=":",
+            linewidth=1.4, label="shuffled training labels (control)")
+    ax.axhline(1 / C, color=MUTED, linewidth=0.8)
+    ax.set_ylim(0, 1.03)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    save_fig(fig, os.path.join(args.out_dir, f"probe_{name}.png"))
+
+    print(f"\n[summary] {name}: accuracy (shuffled-label control)")
+    for l in [l for l in PROBE_LAYERS if l in layers]:
+        print(f"  L{l:<2d} " + "   ".join(f"{r[1]} {r[2][:2]}: {r[3]:.2f} ({r[4]:.2f})"
+                                          for r in rows if r[0] == l))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -407,10 +555,17 @@ def main():
     g.add_argument("--line", default="3,4,5", help="a,b,c: is b between a and c? empty to skip")
     g.add_argument("--n_perm", type=int, default=10000)
     g.add_argument("--seed", type=int, default=0)
-    for sp in (c, s, g):
+    pr = sub.add_parser("probe")
+    pr.add_argument("--grid", required=True)
+    pr.add_argument("--out_dir", required=True)
+    pr.add_argument("--test_init", type=int, default=0)
+    pr.add_argument("--n_shuffle", type=int, default=3)
+    pr.add_argument("--layers", default=None, help="comma list of readouts (default: all)")
+    pr.add_argument("--seed", type=int, default=0)
+    for sp in (c, s, g, pr):
         sp.add_argument("--label", default="", help="extra title line, e.g. the model")
     args = p.parse_args()
-    {"curves": curves, "scatter": scatter, "groups": groups}[args.cmd](args)
+    {"curves": curves, "scatter": scatter, "groups": groups, "probe": probe}[args.cmd](args)
 
 
 if __name__ == "__main__":
