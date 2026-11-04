@@ -17,3 +17,7 @@ slurm-*.out
 # macos
 .DS_Store
 *.log
+
+# Word lock / autosave temp files
+~$*
+~WRL*.tmp
