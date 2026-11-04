@@ -1,0 +1,40 @@
+init,test,statistic,value,p
+0,"group stove [2, 6, 8]",mean log10 pair term inside,-1.154,0.008333
+0,"group drawer [3, 4, 5]",mean log10 pair term inside,-1.396,0.05
+0,"group bowl [0, 1, 5]",mean log10 pair term inside,-1.648,0.5583
+0,"group plate [0, 6, 7, 9]",mean log10 pair term inside,-1.575,0.2286
+0,keyword-sharing pairs vs rest,difference of mean log10 pair term,0.2286,0.0004
+0,word overlap (Mantel),Spearman rho,0.6205,9.999e-05
+0,"line [3, 4, 5]",angle (deg) / position on a->c / offset,117.5 / 0.81 / 0.73,
+1,"group stove [2, 6, 8]",mean log10 pair term inside,-1.112,0.008333
+1,"group drawer [3, 4, 5]",mean log10 pair term inside,-1.367,0.05
+1,"group bowl [0, 1, 5]",mean log10 pair term inside,-1.616,0.5917
+1,"group plate [0, 6, 7, 9]",mean log10 pair term inside,-1.544,0.2762
+1,keyword-sharing pairs vs rest,difference of mean log10 pair term,0.2239,0.0007999
+1,word overlap (Mantel),Spearman rho,0.5897,0.0003
+1,"line [3, 4, 5]",angle (deg) / position on a->c / offset,117.5 / 0.82 / 0.73,
+1,stability vs init 0,Spearman rho of pair terms,0.9959,
+2,"group stove [2, 6, 8]",mean log10 pair term inside,-0.9808,0.008333
+2,"group drawer [3, 4, 5]",mean log10 pair term inside,-1.224,0.05
+2,"group bowl [0, 1, 5]",mean log10 pair term inside,-1.486,0.6333
+2,"group plate [0, 6, 7, 9]",mean log10 pair term inside,-1.405,0.2333
+2,keyword-sharing pairs vs rest,difference of mean log10 pair term,0.2274,0.0006999
+2,word overlap (Mantel),Spearman rho,0.6185,0.0002
+2,"line [3, 4, 5]",angle (deg) / position on a->c / offset,118.1 / 0.81 / 0.74,
+2,stability vs init 0,Spearman rho of pair terms,0.9988,
+3,"group stove [2, 6, 8]",mean log10 pair term inside,-1.085,0.008333
+3,"group drawer [3, 4, 5]",mean log10 pair term inside,-1.367,0.05833
+3,"group bowl [0, 1, 5]",mean log10 pair term inside,-1.603,0.6
+3,"group plate [0, 6, 7, 9]",mean log10 pair term inside,-1.524,0.2333
+3,keyword-sharing pairs vs rest,difference of mean log10 pair term,0.2296,0.0005
+3,word overlap (Mantel),Spearman rho,0.6113,0.0002
+3,"line [3, 4, 5]",angle (deg) / position on a->c / offset,117.4 / 0.80 / 0.74,
+3,stability vs init 0,Spearman rho of pair terms,0.9974,
+4,"group stove [2, 6, 8]",mean log10 pair term inside,-1.031,0.008333
+4,"group drawer [3, 4, 5]",mean log10 pair term inside,-1.301,0.05833
+4,"group bowl [0, 1, 5]",mean log10 pair term inside,-1.552,0.675
+4,"group plate [0, 6, 7, 9]",mean log10 pair term inside,-1.451,0.2095
+4,keyword-sharing pairs vs rest,difference of mean log10 pair term,0.2281,0.0005999
+4,word overlap (Mantel),Spearman rho,0.5892,9.999e-05
+4,"line [3, 4, 5]",angle (deg) / position on a->c / offset,118.6 / 0.84 / 0.73,
+4,stability vs init 0,Spearman rho of pair terms,0.9929,
